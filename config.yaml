@@ -1,0 +1,114 @@
+# Exam Resilience Control Tower (ERCT) - Configuration File
+# Single source of truth for simulation, detection, readiness, and remedy policies.
+
+database:
+  path: "data/erct.db"
+
+exam:
+  id: "EX-2026-PS6-01"
+  name: "MPOnline Assessment Ecosystem Exam 2026"
+  duration_min: 120
+  required_version: "4.2.1"
+  demo_time_scale: 1.0
+
+simulation:
+  centres: 5
+  candidates_per_centre: 40
+  heartbeat_interval_s: 2
+  faults:
+    - { centre: "C-BPL-02", type: "power_loss", at_s: 300, duration_s: 240, source: "ups", backup_minutes: 0 }
+    - { centre: "C-BPL-03", type: "wrong_version" }
+
+centres:
+  - id: "C-BPL-01"
+    name: "Bhopal North Tech Zone"
+    city: "Bhopal"
+    vendor: "EduTech Sol"
+    capacity: 50
+    power_backup: true
+    backup_minutes: 60
+    software_version: "4.2.1"
+  - id: "C-BPL-02"
+    name: "Bhopal South Digital Hub"
+    city: "Bhopal"
+    vendor: "TestMatrix India"
+    capacity: 45
+    power_backup: true
+    backup_minutes: 45
+    software_version: "4.2.1"
+  - id: "C-BPL-03"
+    name: "Bhopal East Assessment Lab"
+    city: "Bhopal"
+    vendor: "EduTech Sol"
+    capacity: 40
+    power_backup: true
+    backup_minutes: 30
+    software_version: "4.2.0" # Mismatched version for readiness gate demo
+  - id: "C-BPL-04"
+    name: "Bhopal West Online Exam Center"
+    city: "Bhopal"
+    vendor: "MeritTrac Labs"
+    capacity: 60
+    power_backup: true
+    backup_minutes: 60
+    software_version: "4.2.1"
+  - id: "C-BPL-05"
+    name: "Bhopal Central Institute"
+    city: "Bhopal"
+    vendor: "TestMatrix India"
+    capacity: 50
+    power_backup: true
+    backup_minutes: 40
+    software_version: "4.2.1"
+
+readiness:
+  min_score: 70
+  weights:
+    version: 40
+    power_backup: 30
+    capacity: 30
+
+detection:
+  heartbeat_gap_s: 6
+  centre_loss_fraction: 0.6         # 60% of sessions silent within window calls centre outage
+  centre_loss_window_s: 10          # Detection window in seconds
+  latency_p95_ms: 1500
+  anomaly:
+    enabled: true
+    threshold: 0.9
+
+integrity:
+  max_timestamp_skew_s: 15          # Max allowable difference between event ts and ingest time
+  login_fail_burst_threshold: 5     # Bursts of login failures indicating brute force / abuse
+  seq_gap_threshold: 10             # Sequence gaps indicating dropped or bypassed telemetry
+
+# Evaluated strictly first-match: R3 -> R4 -> R1 -> R2
+remedy_rules:
+  - id: "R3"
+    desc: "Evidence partial or missing; route to manual review"
+    condition: "quality != 'strong'"
+    action: "manual_review"
+  - id: "R4"
+    desc: "Centre-level integrity failure; recommend centre re-test"
+    condition: "centre_affected_fraction >= 0.5 and integrity_flag"
+    action: "retest_recommended"
+  - id: "R1"
+    desc: "Short interruption with minimal loss; restore remaining time"
+    condition: "lost_s <= 300 and unsaved_answers <= 2"
+    action: "resume"
+  - id: "R2"
+    desc: "Longer interruption or multiple unsaved answers; compensate lost time plus buffer"
+    condition: "lost_s > 300 or unsaved_answers > 2"
+    action: "extra_time"
+    buffer_s: 120
+
+remedy_fairness:
+  max_extra_time_disparity_s: 300
+
+comms:
+  candidate_message_delay_s: 30
+
+audit:
+  anchor_every: 200
+  immudb:
+    enabled: false
