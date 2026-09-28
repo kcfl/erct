@@ -17,7 +17,11 @@ class ExamConfig(BaseModel):
     name: str = "MPOnline Assessment Ecosystem Exam 2026"
     duration_min: int = 120
     required_version: str = "4.2.1"
-    demo_time_scale: float = 1.0
+    exam_clock_speed: float = 1.0
+
+
+class ControlConfig(BaseModel):
+    key: str = "ctrl-secret-key-2026"
 
 
 class FaultConfig(BaseModel):
@@ -33,6 +37,7 @@ class SimulationConfig(BaseModel):
     centres: int = 5
     candidates_per_centre: int = 40
     heartbeat_interval_s: int = 2
+    flaky_fraction: float = 0.1
     faults: List[FaultConfig] = Field(default_factory=list)
 
 
@@ -106,6 +111,7 @@ class AuditConfig(BaseModel):
 class AppConfig(BaseModel):
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     exam: ExamConfig = Field(default_factory=ExamConfig)
+    control: ControlConfig = Field(default_factory=ControlConfig)
     simulation: SimulationConfig = Field(default_factory=SimulationConfig)
     centres: List[CentreConfig] = Field(default_factory=list)
     readiness: ReadinessConfig = Field(default_factory=ReadinessConfig)

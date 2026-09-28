@@ -156,6 +156,18 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_log_seq ON audit_log(seq);
+
+CREATE TABLE IF NOT EXISTS fault_commands (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    centre_id TEXT NOT NULL,
+    fault_type TEXT NOT NULL,
+    duration_s INTEGER NOT NULL,
+    params TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    ended_at TEXT
+);
 """
 
 

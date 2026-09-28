@@ -8,7 +8,7 @@ from fastapi import APIRouter, Header, HTTPException, Request, Response, status
 from pydantic import ValidationError
 
 from app.config import get_config
-from app.core.audit_chain import append_audit_entry, canonical_json
+from app.core.audit_chain import GENESIS_PREV_HASH, append_audit_entry, canonical_json, compute_entry_hash
 from app.db import write_transaction
 from app.models.events import BatchIngestResponse, EventEnvelope, EventType
 
@@ -123,6 +123,18 @@ async def ingest_events(
     with write_transaction() as conn:
         cursor = conn.cursor()
 
+        # Query latest audit entry once for the entire batch
+        cursor.execute("SELECT seq, entry_hash FROM audit_log ORDER BY seq DESC LIMIT 1;")
+        latest_audit = cursor.fetchone()
+        if latest_audit is None:
+            current_seq = 0
+            current_prev_hash = GENESIS_PREV_HASH
+        else:
+            current_seq = int(latest_audit["seq"])
+            current_prev_hash = str(latest_audit["entry_hash"])
+
+        audit_inserts = []
+
         for ev in validated_events:
             canon_payload = canonical_json(ev.payload)
 
@@ -197,16 +209,40 @@ async def ingest_events(
                             (ev.session_id,),
                         )
 
-                # Append to audit hash chain ONLY for brand-new events
-                append_audit_entry(
+                # Prepare audit log row in sequence
+                current_seq += 1
+                entry_hash = compute_entry_hash(
+                    prev_hash=current_prev_hash,
+                    seq=current_seq,
+                    ts_iso=now_iso,
                     entry_type="event",
                     ref_id=ev.event_id,
-                    payload=ev.model_dump(),
-                    ts_iso=now_iso,
-                    conn=conn,
+                    canonical_payload=canon_payload,
                 )
+                audit_inserts.append(
+                    (
+                        current_seq,
+                        now_iso,
+                        "event",
+                        ev.event_id,
+                        canon_payload,
+                        current_prev_hash,
+                        entry_hash,
+                    )
+                )
+                current_prev_hash = entry_hash
             else:
                 duplicate_count += 1
+
+        # Bulk insert all new audit entries for this batch
+        if audit_inserts:
+            cursor.executemany(
+                """
+                INSERT INTO audit_log (seq, ts, entry_type, ref_id, payload, prev_hash, entry_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?);
+                """,
+                audit_inserts,
+            )
 
         cursor.close()
 

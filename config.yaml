@@ -9,12 +9,16 @@ exam:
   name: "MPOnline Assessment Ecosystem Exam 2026"
   duration_min: 120
   required_version: "4.2.1"
-  demo_time_scale: 1.0
+  exam_clock_speed: 1.0
+
+control:
+  key: "ctrl-secret-key-2026"
 
 simulation:
   centres: 5
   candidates_per_centre: 40
   heartbeat_interval_s: 2
+  flaky_fraction: 0.1
   faults:
     - { centre: "C-BPL-02", type: "power_loss", at_s: 300, duration_s: 240, source: "ups", backup_minutes: 0 }
     - { centre: "C-BPL-03", type: "wrong_version" }

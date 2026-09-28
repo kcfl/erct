@@ -40,16 +40,20 @@
 ---
 
 ## 4. Power Loss Signature & Detection Engine
-- **Telemetry Signature:** Centre edge agent emits `POWER_LOSS` (`source`: grid/ups/generator, `backup_minutes`), immediately followed by heartbeat silence from all candidate sessions at that centre.
+- **Telemetry Signature & Edge Agent UPS Assumption:** Centre edge agent emits `POWER_LOSS` (`source`: grid/ups/generator, `backup_minutes`), under the operational assumption that the centre edge node possesses a localized micro-UPS providing 15-30 seconds of auxiliary power to broadcast a last-gasp outage alert. Immediately following this, all workstations and sessions at that centre go silent (machines powered down; zero telemetry generated or buffered).
 - **Detection Criteria:**
   - Explicit `POWER_LOSS` event received, OR
   - $\ge 60\%$ (configurable via `detection.centre_loss_fraction`) of sessions at a centre go silent within a 10s window (`detection.centre_loss_window_s`).
-- **Heartbeat Rhythm:** Normal heartbeat every 2s (`simulation.heartbeat_interval_s`); silence declared after 6s gap (`detection.heartbeat_gap_s`). Incident opens within 10 seconds.
+- **Heartbeat Rhythm & Time Decision:**
+  - Event `ts` is **ALWAYS real UTC** (`datetime.now(timezone.utc).isoformat()`).
+  - Cadence intervals (2s) and fault durations (e.g. 240s) are in **real wall-clock seconds**. No artificial clock warping or timestamp compression is permitted.
+  - Setting `exam_clock_speed` (default 1.0) scales strictly the rate at which `remaining_s` decrements within active sessions.
+  - Tests shorten intervals purely via configuration overrides (e.g. `heartbeat_interval_s: 0.5`), never by faking timestamps.
+- **Payload Extension (`local_seq`):** Candidate `HEARTBEAT` payloads support an optional `local_seq` field representing local client-side answer submissions before server-side persistence (`saved_seq`). This allows deterministic modelling of 0-4 unsaved answers at outage inception. After a power outage, unsaved answers are wiped and `local_seq` resets to `last_saved_seq`.
 - **Incident Classification:**
   - Classify as `power` if a `POWER_LOSS` event exists within the detection window.
   - Classify as `network` if a `NETWORK_DOWN` event exists within the detection window.
   - Otherwise, classify as `network` with `evidence_quality = partial` (low confidence flag).
-- **Time Compression:** Support a configurable `demo_time_scale` in `config.yaml` to accelerate demo timelines if needed.
 
 ---
 

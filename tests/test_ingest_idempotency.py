@@ -320,3 +320,133 @@ def test_seeding_twice_idempotency(clean_test_environment):
 
     assert cands_after == 200
     assert sess_after == 200
+
+
+def test_candidate_heartbeat_cadence():
+    """Candidate cadence test: with a 2s interval, each candidate produces 5 heartbeats in 10s (tolerance 1)."""
+    from simulator.agent_runner import CandidateClient
+
+    client = CandidateClient(
+        candidate_id="CAND-000001",
+        session_id="SES-000001-1",
+        centre_id="C-BPL-01",
+        api_key="key-cbpl01-secret",
+        exam_id="EX-2026-PS6-01",
+        duration_min=120,
+        is_flaky=False,
+    )
+
+    interval_s = 2.0
+    total_duration_s = 10.0
+    num_steps = int(total_duration_s / interval_s)  # 5 steps
+
+    heartbeats = []
+    for _ in range(num_steps):
+        hb = client.tick_heartbeat(elapsed_real_s=interval_s)
+        if hb:
+            heartbeats.append(hb)
+
+    # Must produce 5 heartbeats in 10s with tolerance 1 (4 to 6)
+    assert abs(len(heartbeats) - 5) <= 1
+
+
+def test_buffer_dead_letter_on_422(clean_test_environment):
+    """Buffer moves permanently invalid events (422) to dead_letter table and does not retry them."""
+    client = TestClient(app)
+    buffer_path = clean_test_environment["buffer_path"]
+    buffer = StoreAndForwardBuffer(buffer_path)
+
+    # Enqueue an event missing required payload fields (will yield 422)
+    invalid_ev = {
+        "event_id": str(uuid.uuid4()),
+        "schema_ver": 1,
+        "ts": "2026-09-29T10:00:00Z",
+        "exam_id": "EX-2026-PS6-01",
+        "centre_id": "C-BPL-01",
+        "seq": 1,
+        "type": "HEARTBEAT",
+        "payload": {},  # Missing latency_ms and remaining_s
+    }
+    buffer.enqueue(invalid_ev, centre_id="C-BPL-01", api_key="key-cbpl01-secret")
+    assert buffer.get_pending_count() == 1
+    assert buffer.get_dead_letter_count() == 0
+
+    # Start live test server for buffer drain
+    port = 8769
+    server_config = uvicorn.Config(app=app, host="127.0.0.1", port=port, log_level="warning")
+    server = uvicorn.Server(server_config)
+    server_thread = threading.Thread(target=server.run, daemon=True)
+    server_thread.start()
+    time.sleep(0.8)
+
+    try:
+        live_url = f"http://127.0.0.1:{port}"
+        res = buffer.drain_once(api_base_url=live_url)
+        assert res["dead_lettered"] == 1
+        assert buffer.get_pending_count() == 0
+        assert buffer.get_dead_letter_count() == 1
+    finally:
+        server.should_exit = True
+        server_thread.join(timeout=2.0)
+
+
+def test_buffer_pause_centre_delivery(clean_test_environment):
+    """Buffer delivery can be paused per centre; paused centre events stay buffered while other centres drain."""
+    buffer_path = clean_test_environment["buffer_path"]
+    buffer = StoreAndForwardBuffer(buffer_path)
+
+    # Centre 1 and Centre 2 events
+    ev1 = {
+        "event_id": str(uuid.uuid4()),
+        "schema_ver": 1,
+        "ts": "2026-09-29T10:00:00Z",
+        "exam_id": "EX-2026-PS6-01",
+        "centre_id": "C-BPL-01",
+        "seq": 1,
+        "type": "SOFTWARE_VERSION_REPORT",
+        "payload": {"version": "4.2.1", "required_version": "4.2.1"},
+    }
+    ev2 = {
+        "event_id": str(uuid.uuid4()),
+        "schema_ver": 1,
+        "ts": "2026-09-29T10:00:00Z",
+        "exam_id": "EX-2026-PS6-01",
+        "centre_id": "C-BPL-02",
+        "seq": 1,
+        "type": "SOFTWARE_VERSION_REPORT",
+        "payload": {"version": "4.2.1", "required_version": "4.2.1"},
+    }
+
+    buffer.enqueue(ev1, centre_id="C-BPL-01", api_key="key-cbpl01-secret")
+    buffer.enqueue(ev2, centre_id="C-BPL-02", api_key="key-cbpl02-secret")
+    assert buffer.get_pending_count() == 2
+
+    # Pause Centre 2
+    buffer.pause_centre("C-BPL-02")
+    assert buffer.is_centre_paused("C-BPL-02") is True
+    assert buffer.is_centre_paused("C-BPL-01") is False
+
+    port = 8770
+    server_config = uvicorn.Config(app=app, host="127.0.0.1", port=port, log_level="warning")
+    server = uvicorn.Server(server_config)
+    server_thread = threading.Thread(target=server.run, daemon=True)
+    server_thread.start()
+    time.sleep(0.8)
+
+    try:
+        live_url = f"http://127.0.0.1:{port}"
+        res1 = buffer.drain_once(api_base_url=live_url)
+        # Centre 1 drained, Centre 2 skipped because paused
+        assert res1["accepted"] == 1
+        assert buffer.get_pending_count() == 1
+        assert buffer.get_pending_count(centre_id="C-BPL-02") == 1
+
+        # Resume Centre 2 and drain
+        buffer.resume_centre("C-BPL-02")
+        res2 = buffer.drain_once(api_base_url=live_url)
+        assert res2["accepted"] == 1
+        assert buffer.get_pending_count() == 0
+    finally:
+        server.should_exit = True
+        server_thread.join(timeout=2.0)
+
