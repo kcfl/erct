@@ -91,7 +91,10 @@ def append_audit_entry(
     if ts_iso is None:
         ts_iso = datetime.now(timezone.utc).isoformat()
 
-    with write_transaction(db_path) as conn:
+    target_db = resolve_db_path(db_path)
+    init_db(target_db)
+
+    with write_transaction(target_db) as conn:
         cursor = conn.cursor()
 
         # Query the latest entry to link hash and determine next sequence
@@ -215,14 +218,29 @@ def tamper_audit_entry_for_demo(
     tampered_payload: Optional[Dict[str, Any]] = None,
     db_path: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """[DEMO ONLY] Directly executes a raw SQL UPDATE bypassing hash calculation to simulate tampering."""
+    """[DEMO ONLY] Directly executes a raw SQL UPDATE bypassing hash calculation to simulate tampering.
+    Saves the original payload to audit_tamper_backup so that restore can run with no arguments.
+    """
     if tampered_payload is None:
         tampered_payload = {"tampered": True, "unauthorized_change": "Malicious score/remedy overwrite"}
 
     raw_json = json.dumps(tampered_payload, separators=(",", ":"))
+    target_db = resolve_db_path(db_path)
+    init_db(target_db)
 
-    with write_transaction(db_path) as conn:
+    with write_transaction(target_db) as conn:
         cursor = conn.cursor()
+        # Ensure side table for demo backups exists
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_tamper_backup (
+                seq INTEGER PRIMARY KEY,
+                original_payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+
         cursor.execute("SELECT seq, payload, entry_hash FROM audit_log WHERE seq = ?;", (seq,))
         row = cursor.fetchone()
         if not row:
@@ -230,6 +248,15 @@ def tamper_audit_entry_for_demo(
             raise ValueError(f"Audit log entry with seq={seq} does not exist.")
 
         original_payload = row["payload"]
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # Save to side table
+        cursor.execute(
+            "INSERT OR REPLACE INTO audit_tamper_backup (seq, original_payload, created_at) VALUES (?, ?, ?);",
+            (seq, original_payload, now_iso),
+        )
+
+        # Tamper payload
         cursor.execute("UPDATE audit_log SET payload = ? WHERE seq = ?;", (raw_json, seq))
         cursor.close()
 
@@ -242,17 +269,55 @@ def tamper_audit_entry_for_demo(
 
 
 def restore_audit_entry_for_demo(
-    seq: int,
-    original_payload: str,
+    seq: Optional[int] = None,
+    original_payload: Optional[str] = None,
     db_path: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """[DEMO ONLY] Restores an altered audit row to its original payload to reset the demo."""
-    with write_transaction(db_path) as conn:
+    """[DEMO ONLY] Restores altered audit rows to their original payloads.
+    If seq is None, restores ALL entries recorded in audit_tamper_backup.
+    """
+    target_db = resolve_db_path(db_path)
+    init_db(target_db)
+
+    with write_transaction(target_db) as conn:
         cursor = conn.cursor()
-        cursor.execute("UPDATE audit_log SET payload = ? WHERE seq = ?;", (original_payload, seq))
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_tamper_backup (
+                seq INTEGER PRIMARY KEY,
+                original_payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+
+        restored_seqs = []
+        if seq is not None and original_payload is not None:
+            cursor.execute("UPDATE audit_log SET payload = ? WHERE seq = ?;", (original_payload, seq))
+            cursor.execute("DELETE FROM audit_tamper_backup WHERE seq = ?;", (seq,))
+            restored_seqs.append(seq)
+        elif seq is not None:
+            cursor.execute("SELECT original_payload FROM audit_tamper_backup WHERE seq = ?;", (seq,))
+            row = cursor.fetchone()
+            if row:
+                cursor.execute("UPDATE audit_log SET payload = ? WHERE seq = ?;", (row["original_payload"], seq))
+                cursor.execute("DELETE FROM audit_tamper_backup WHERE seq = ?;", (seq,))
+                restored_seqs.append(seq)
+            else:
+                cursor.close()
+                raise ValueError(f"No backup payload found for seq={seq}")
+        else:
+            # Restore all backed-up entries
+            cursor.execute("SELECT seq, original_payload FROM audit_tamper_backup;")
+            rows = cursor.fetchall()
+            for r in rows:
+                cursor.execute("UPDATE audit_log SET payload = ? WHERE seq = ?;", (r["original_payload"], r["seq"]))
+                restored_seqs.append(r["seq"])
+            cursor.execute("DELETE FROM audit_tamper_backup;")
+
         cursor.close()
 
-    return {"status": "restored", "seq": seq}
+    return {"status": "restored", "restored_seqs": restored_seqs}
 
 
 def get_audit_trail(limit: int = 50, db_path: Optional[str] = None) -> List[AuditEntry]:
@@ -299,8 +364,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="ERCT Audit Hash Chain CLI")
     parser.add_argument("--verify", action="store_true", help="Verify the integrity of the audit log")
     parser.add_argument("--tamper", type=int, help="[DEMO ONLY] Alter payload of entry at given seq")
-    parser.add_argument("--restore", type=int, help="[DEMO ONLY] Restore entry at seq (requires --payload)")
-    parser.add_argument("--payload", type=str, help="Payload string for restore operation")
+    parser.add_argument(
+        "--restore",
+        nargs="?",
+        const=-1,
+        type=int,
+        default=None,
+        help="[DEMO ONLY] Restore tampered entries. If no seq given, restores all.",
+    )
     parser.add_argument("--inspect", type=int, default=10, help="Show the last N audit entries")
     args = parser.parse_args()
 
@@ -319,11 +390,9 @@ def main() -> None:
         sys.exit(0)
 
     elif args.restore is not None:
-        if not args.payload:
-            print("[ERROR] --restore requires --payload")
-            sys.exit(1)
-        res = restore_audit_entry_for_demo(args.restore, args.payload)
-        print(f"[DEMO] Restored entry seq {args.restore}.")
+        target_seq = None if args.restore == -1 else args.restore
+        res = restore_audit_entry_for_demo(seq=target_seq)
+        print(f"[DEMO] Restored entries: {res['restored_seqs']}.")
         sys.exit(0)
 
     else:

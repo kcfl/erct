@@ -8,6 +8,7 @@
 ## 1. Environment & Operational Baseline
 - **Primary OS:** Windows 10/11 is primary. Scripts and commands must quote all paths containing spaces.
 - **Process Orchestration (`run.bat`):** Must start the FastAPI backend and the simulator as **two separate processes** with independent PIDs to enable the live API kill/restart zero-duplicate replay demo.
+- **Process Isolation & DB Ownership:** The audit chain and SQLite database are written **ONLY by the API process**. The simulator NEVER opens SQLite or connects to the database; it interacts exclusively over the HTTP API (`POST /v1/events`).
 - **Console Output:** Clean ASCII output only. No Unicode emoji or special characters that can break Windows `cmd.exe` or PowerShell codepages.
 - **Server:** `uvicorn` run without `--reload` for stability and predictable single-process state.
 - **Docker:** Low-priority secondary fallback; single-command native execution via `run.bat` is primary.

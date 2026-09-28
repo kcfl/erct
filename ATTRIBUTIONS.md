@@ -28,7 +28,7 @@ In compliance with the hackathon rules and ethical development practices, this d
 | Standard | Description | Application in ERCT |
 | :--- | :--- | :--- |
 | **SHA-256 (FIPS 180-4)** | Cryptographic hash algorithm | Generates deterministic tamper-evident hash links for the audit chain. |
-| **RFC 8785** | JSON Canonicalization Scheme (JCS) | Normalizes audit JSON payloads (sorted keys, no whitespace, UTF-8) before hashing. |
+| **Sorted-Key Compact JSON** | Deterministic JSON serialization | Normalizes audit JSON payloads (sorted keys, separators=(',', ':'), no whitespace, UTF-8) before hashing. |
 | **ISO 8601** | Date and time representation | Universal UTC timestamp representation across all telemetry and audit blocks. |
 
 ---

@@ -143,17 +143,42 @@ def test_tamper_detection_pinpoint(test_db: str) -> None:
     assert verify_fail.failing_seq == 14
     assert "Hash mismatch at seq 14" in (verify_fail.error or "")
 
-    # Restore the entry and confirm verification passes again
+    # Restore the entry without providing payload and confirm verification passes again
     restore_result = restore_audit_entry_for_demo(
         seq=14,
-        original_payload=tamper_result["original_payload"],
         db_path=test_db,
     )
     assert restore_result["status"] == "restored"
+    assert 14 in restore_result["restored_seqs"]
 
     verify_restored = verify_audit_chain(test_db)
     assert verify_restored.ok is True
     assert verify_restored.total_entries == 20
+
+
+def test_tamper_and_restore_no_args(test_db: str) -> None:
+    """Tampering entries and calling restore with NO arguments restores all tampered rows."""
+    for i in range(1, 11):
+        append_audit_entry("event", f"EVT-{i}", {"step": i}, db_path=test_db)
+
+    # Tamper rows 3 and 7
+    tamper_audit_entry_for_demo(seq=3, db_path=test_db)
+    tamper_audit_entry_for_demo(seq=7, db_path=test_db)
+
+    # Verification must fail at first tampered row (seq 3)
+    res_fail = verify_audit_chain(test_db)
+    assert res_fail.ok is False
+    assert res_fail.failing_seq == 3
+
+    # Restore with ZERO arguments (seq=None, payload=None)
+    restore_all = restore_audit_entry_for_demo(db_path=test_db)
+    assert restore_all["status"] == "restored"
+    assert set(restore_all["restored_seqs"]) == {3, 7}
+
+    # Verification must now pass completely
+    res_pass = verify_audit_chain(test_db)
+    assert res_pass.ok is True
+    assert res_pass.total_entries == 10
 
 
 def test_tamper_prev_hash_detection(test_db: str) -> None:
@@ -185,10 +210,10 @@ def test_sequence_gap_detection(test_db: str) -> None:
 
 
 def test_concurrent_appends_thread_safety(test_db: str) -> None:
-    """Multiple threads appending simultaneously must produce a strictly continuous, verified chain."""
+    """Multiple threads appending simultaneously must produce a strictly continuous, verified chain with 200 appends."""
     num_threads = 10
-    appends_per_thread = 15
-    total_expected = num_threads * appends_per_thread
+    appends_per_thread = 20
+    total_expected = num_threads * appends_per_thread  # 200 appends
 
     def worker(worker_id: int):
         for i in range(appends_per_thread):

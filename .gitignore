@@ -8,10 +8,12 @@ __pycache__/
 .coverage
 htmlcov/
 
-# Local databases and WAL logs
-data/*.db
-data/*.db-wal
-data/*.db-shm
+# Local databases and runtime state
+data/
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
 
 # Environments
 .venv/
