@@ -78,10 +78,12 @@ def append_audit_entry(
     payload: Union[Dict[str, Any], List[Any], Any],
     ts_iso: Optional[str] = None,
     db_path: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
 ) -> AuditEntry:
     """Append a new record to the audit chain under the thread-safe writer lock.
 
     Guarantees monotonic seq, canonical payload encoding, and link to previous entry_hash.
+    If an existing write connection is provided, reuses it to participate in the same transaction.
     """
     # Exact canonical representation
     canon_payload_str = canonical_json(payload)
@@ -91,13 +93,8 @@ def append_audit_entry(
     if ts_iso is None:
         ts_iso = datetime.now(timezone.utc).isoformat()
 
-    target_db = resolve_db_path(db_path)
-    init_db(target_db)
-
-    with write_transaction(target_db) as conn:
-        cursor = conn.cursor()
-
-        # Query the latest entry to link hash and determine next sequence
+    def _execute_append(c: sqlite3.Connection) -> Tuple[int, str, str]:
+        cursor = c.cursor()
         cursor.execute("SELECT seq, entry_hash FROM audit_log ORDER BY seq DESC LIMIT 1;")
         latest = cursor.fetchone()
 
@@ -124,8 +121,16 @@ def append_audit_entry(
             """,
             (seq, ts_iso, entry_type, ref_id, canon_payload_str, prev_hash, entry_hash),
         )
-
         cursor.close()
+        return seq, prev_hash, entry_hash
+
+    if conn is not None:
+        seq, prev_hash, entry_hash = _execute_append(conn)
+    else:
+        target_db = resolve_db_path(db_path)
+        init_db(target_db)
+        with write_transaction(target_db) as new_conn:
+            seq, prev_hash, entry_hash = _execute_append(new_conn)
 
     return AuditEntry(
         seq=seq,

@@ -28,6 +28,7 @@ centres:
     power_backup: true
     backup_minutes: 60
     software_version: "4.2.1"
+    api_key: "key-cbpl01-secret"
   - id: "C-BPL-02"
     name: "Bhopal South Digital Hub"
     city: "Bhopal"
@@ -36,6 +37,7 @@ centres:
     power_backup: true
     backup_minutes: 45
     software_version: "4.2.1"
+    api_key: "key-cbpl02-secret"
   - id: "C-BPL-03"
     name: "Bhopal East Assessment Lab"
     city: "Bhopal"
@@ -44,6 +46,7 @@ centres:
     power_backup: true
     backup_minutes: 30
     software_version: "4.2.0" # Mismatched version for readiness gate demo
+    api_key: "key-cbpl03-secret"
   - id: "C-BPL-04"
     name: "Bhopal West Online Exam Center"
     city: "Bhopal"
@@ -52,6 +55,7 @@ centres:
     power_backup: true
     backup_minutes: 60
     software_version: "4.2.1"
+    api_key: "key-cbpl04-secret"
   - id: "C-BPL-05"
     name: "Bhopal Central Institute"
     city: "Bhopal"
@@ -60,6 +64,7 @@ centres:
     power_backup: true
     backup_minutes: 40
     software_version: "4.2.1"
+    api_key: "key-cbpl05-secret"
 
 readiness:
   min_score: 70

@@ -45,6 +45,7 @@ class CentreConfig(BaseModel):
     power_backup: bool = True
     backup_minutes: int = 60
     software_version: str = "4.2.1"
+    api_key: str = "key-default"
 
 
 class ReadinessWeights(BaseModel):

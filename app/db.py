@@ -10,8 +10,8 @@ from typing import Generator, Optional
 
 from app.config import get_config
 
-# Global thread-safe writer lock to serialize SQLite writes and audit appends
-DB_WRITE_LOCK = threading.Lock()
+# Global thread-safe re-entrant writer lock to serialize SQLite writes and audit appends
+DB_WRITE_LOCK = threading.RLock()
 
 SCHEMA_DDL = """
 -- ERCT SQLite Schema (Converted from PostgreSQL specifications)
