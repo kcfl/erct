@@ -12,6 +12,7 @@ from app.core.audit_chain import append_audit_entry
 from app.db import get_db_connection, write_transaction
 
 router = APIRouter(prefix="/v1/control", tags=["Control"])
+HTTP_422 = getattr(status, "HTTP_422_UNPROCESSABLE_CONTENT", 422)
 
 
 class CreateFaultCommandRequest(BaseModel):
@@ -61,14 +62,14 @@ def create_fault_command(
     valid_centres = {c.id for c in cfg.centres}
     if req.centre_id not in valid_centres:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=HTTP_422,
             detail=f"Unknown centre '{req.centre_id}'. Valid centres: {list(valid_centres)}",
         )
 
     # Validate fault type
     if req.fault_type not in ("power_loss", "network_drop", "wrong_version"):
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=HTTP_422,
             detail=f"Unsupported fault type '{req.fault_type}'.",
         )
 

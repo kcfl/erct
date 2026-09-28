@@ -15,6 +15,20 @@ from typing import Any, Dict, List, Optional, Set, Union
 import httpx
 
 
+def format_utc_iso(dt: Optional[datetime] = None) -> str:
+    """Return canonical UTC ISO 8601 string: YYYY-MM-DDTHH:MM:SS.ffffff+00:00.
+
+    Guarantees fixed length (32 chars) and fixed '+00:00' timezone suffix so that
+    lexicographical text comparisons (<, <=, >, >=) in SQLite match true chronological order.
+    """
+    d = dt or datetime.now(timezone.utc)
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    else:
+        d = d.astimezone(timezone.utc)
+    return d.strftime("%Y-%m-%dT%H:%M:%S.%f+00:00")
+
+
 class StoreAndForwardBuffer:
     """Manages outbound event buffering, retries, dead-lettering, per-centre pause, and confirmed dispatch."""
 
@@ -89,7 +103,7 @@ class StoreAndForwardBuffer:
 
     def pause_centre(self, centre_id: str) -> None:
         """Pause outgoing delivery for a specific centre (simulates network drop)."""
-        now_iso = datetime.now(timezone.utc).isoformat()
+        now_iso = format_utc_iso()
         with self._lock, self._get_connection() as conn:
             conn.execute(
                 """
@@ -102,7 +116,7 @@ class StoreAndForwardBuffer:
 
     def resume_centre(self, centre_id: str) -> None:
         """Resume outgoing delivery for a specific centre."""
-        now_iso = datetime.now(timezone.utc).isoformat()
+        now_iso = format_utc_iso()
         with self._lock, self._get_connection() as conn:
             conn.execute(
                 """
@@ -149,7 +163,7 @@ class StoreAndForwardBuffer:
         if not events:
             return 0
 
-        now_iso = datetime.now(timezone.utc).isoformat()
+        now_iso = format_utc_iso()
         rows_to_insert = []
 
         for ev in events:
@@ -213,7 +227,7 @@ class StoreAndForwardBuffer:
         - 422: permanently invalid events moved to dead_letter table, never retried.
         - 401, 5xx, or network failure: applies capped exponential backoff.
         """
-        now_iso = datetime.now(timezone.utc).isoformat()
+        now_iso = format_utc_iso()
         stats = {"dispatched": 0, "accepted": 0, "duplicates": 0, "dead_lettered": 0, "failed": 0}
 
         paused_centres = self.get_paused_centres()
@@ -288,7 +302,7 @@ class StoreAndForwardBuffer:
 
                     elif resp.status_code == 422:
                         error_detail = resp.text
-                        now_dl = datetime.now(timezone.utc).isoformat()
+                        now_dl = format_utc_iso()
                         dl_rows = [
                             (eid, centre_id, ejson, error_detail, now_dl)
                             for eid, ejson in zip(event_ids, event_jsons)
@@ -352,7 +366,7 @@ class StoreAndForwardBuffer:
             for r_id, att in zip(row_ids, attempts_list):
                 new_att = att + 1
                 backoff_s = min(30.0, 0.5 * (2 ** min(new_att, 6)))
-                next_retry = (now + timedelta(seconds=backoff_s)).isoformat()
+                next_retry = format_utc_iso(now + timedelta(seconds=backoff_s))
                 conn.execute(
                     """
                     UPDATE outbound_events

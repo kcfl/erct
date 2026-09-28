@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
 import threading
@@ -9,6 +10,21 @@ from contextlib import contextmanager
 from typing import Generator, Optional
 
 from app.config import get_config
+
+
+def format_utc_iso(dt: Optional[datetime] = None) -> str:
+    """Return canonical UTC ISO 8601 string: YYYY-MM-DDTHH:MM:SS.ffffff+00:00.
+
+    Guarantees fixed length (32 chars) and fixed '+00:00' timezone suffix so that
+    lexicographical text comparisons (<, <=, >, >=) in SQLite match true chronological order.
+    """
+    d = dt or datetime.now(timezone.utc)
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    else:
+        d = d.astimezone(timezone.utc)
+    return d.strftime("%Y-%m-%dT%H:%M:%S.%f+00:00")
+
 
 # Global thread-safe re-entrant writer lock to serialize SQLite writes and audit appends
 DB_WRITE_LOCK = threading.RLock()
@@ -55,7 +71,15 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_saved_seq INTEGER DEFAULT 0,
     answers_saved INTEGER DEFAULT 0,
     remaining_s INTEGER,
+    last_ingested_at TEXT,
     state TEXT NOT NULL DEFAULT 'active'
+);
+
+CREATE TABLE IF NOT EXISTS centre_liveness (
+    centre_id TEXT PRIMARY KEY,
+    last_ingested_at TEXT NOT NULL,
+    last_event_ts TEXT NOT NULL,
+    events_total INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS events (

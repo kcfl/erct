@@ -168,8 +168,8 @@ def test_power_loss_fault_execution(running_test_api: Dict[str, Any]):
         heartbeat_override_s=interval_s,
     )
 
-    # Run simulator in background thread for 6.0 seconds
-    runner_thread = threading.Thread(target=runner.start, kwargs={"duration_s": 6.0}, daemon=True)
+    # Run simulator in background thread for 9.0 seconds to allow staggered candidate reboot window
+    runner_thread = threading.Thread(target=runner.start, kwargs={"duration_s": 9.0}, daemon=True)
     runner_thread.start()
 
     # Wait for initial steps to start
@@ -188,7 +188,7 @@ def test_power_loss_fault_execution(running_test_api: Dict[str, Any]):
     )
     assert resp.status_code == 201
 
-    runner_thread.join(timeout=10.0)
+    runner_thread.join(timeout=14.0)
 
     # Database assertions
     with get_db_connection(db_path) as conn:

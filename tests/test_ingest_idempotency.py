@@ -196,7 +196,7 @@ def test_store_and_forward_buffer_failover(clean_test_environment):
 
     # Run a live test server on loopback port
     port = 8765
-    server_config = uvicorn.Config(app=app, host="127.0.0.1", port=port, log_level="warning")
+    server_config = uvicorn.Config(app=app, host="127.0.0.1", port=port, log_level="warning", ws="none")
     server = uvicorn.Server(server_config)
 
     server_thread = threading.Thread(target=server.run, daemon=True)
@@ -373,7 +373,7 @@ def test_buffer_dead_letter_on_422(clean_test_environment):
 
     # Start live test server for buffer drain
     port = 8769
-    server_config = uvicorn.Config(app=app, host="127.0.0.1", port=port, log_level="warning")
+    server_config = uvicorn.Config(app=app, host="127.0.0.1", port=port, log_level="warning", ws="none")
     server = uvicorn.Server(server_config)
     server_thread = threading.Thread(target=server.run, daemon=True)
     server_thread.start()
@@ -427,7 +427,7 @@ def test_buffer_pause_centre_delivery(clean_test_environment):
     assert buffer.is_centre_paused("C-BPL-01") is False
 
     port = 8770
-    server_config = uvicorn.Config(app=app, host="127.0.0.1", port=port, log_level="warning")
+    server_config = uvicorn.Config(app=app, host="127.0.0.1", port=port, log_level="warning", ws="none")
     server = uvicorn.Server(server_config)
     server_thread = threading.Thread(target=server.run, daemon=True)
     server_thread.start()
@@ -446,6 +446,89 @@ def test_buffer_pause_centre_delivery(clean_test_environment):
         res2 = buffer.drain_once(api_base_url=live_url)
         assert res2["accepted"] == 1
         assert buffer.get_pending_count() == 0
+    finally:
+        server.should_exit = True
+        server_thread.join(timeout=2.0)
+
+
+def test_buffer_retry_time_filtering(tmp_path: Path):
+    """Step 1b: Verify row with future next_retry_at is NOT sent, row with past next_retry_at IS sent."""
+    from simulator.buffer import format_utc_iso
+    from datetime import datetime, timezone, timedelta
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    live_url = f"http://127.0.0.1:{port}"
+    db_file = tmp_path / "time_filter_db.db"
+    buffer_file = tmp_path / "time_filter_buf.db"
+
+    init_db(str(db_file))
+    seed_database(str(db_file))
+
+    server_config = uvicorn.Config(app=app, host="127.0.0.1", port=port, log_level="warning", ws="none")
+    server = uvicorn.Server(server_config)
+    server_thread = threading.Thread(target=server.run, daemon=True)
+    server_thread.start()
+
+    time.sleep(0.8)
+
+    try:
+        buffer = StoreAndForwardBuffer(str(buffer_file))
+        now = datetime.now(timezone.utc)
+
+        # Enqueue two events using the code itself
+        ev_past = {
+            "event_id": str(uuid.uuid4()),
+            "schema_ver": 1,
+            "ts": format_utc_iso(now - timedelta(seconds=10)),
+            "exam_id": "EX-2026-PS6-01",
+            "centre_id": "C-BPL-01",
+            "candidate_id": "CAND-000001",
+            "session_id": "SES-000001-1",
+            "seq": 1,
+            "type": "HEARTBEAT",
+            "payload": {"latency_ms": 20, "remaining_s": 7200, "local_seq": 1},
+        }
+        ev_future = {
+            "event_id": str(uuid.uuid4()),
+            "schema_ver": 1,
+            "ts": format_utc_iso(now),
+            "exam_id": "EX-2026-PS6-01",
+            "centre_id": "C-BPL-01",
+            "candidate_id": "CAND-000001",
+            "session_id": "SES-000001-1",
+            "seq": 2,
+            "type": "HEARTBEAT",
+            "payload": {"latency_ms": 20, "remaining_s": 7198, "local_seq": 1},
+        }
+
+        buffer.enqueue(ev_past, centre_id="C-BPL-01", api_key="key-cbpl01-secret")
+        buffer.enqueue(ev_future, centre_id="C-BPL-01", api_key="key-cbpl01-secret")
+
+        # Manually set retry schedules using code's format_utc_iso:
+        # One with past retry time (-10s), one with future retry time (+60s)
+        past_iso = format_utc_iso(now - timedelta(seconds=10))
+        future_iso = format_utc_iso(now + timedelta(seconds=60))
+
+        with buffer._lock, buffer._get_connection() as conn:
+            conn.execute("UPDATE outbound_events SET next_retry_at = ? WHERE event_id = ?;", (past_iso, ev_past["event_id"]))
+            conn.execute("UPDATE outbound_events SET next_retry_at = ? WHERE event_id = ?;", (future_iso, ev_future["event_id"]))
+            conn.commit()
+
+        # Drain: only past row should be eligible and dispatched
+        res = buffer.drain_once(api_base_url=live_url)
+        assert res["accepted"] == 1
+        assert res["dispatched"] == 1
+
+        # Future event remains safely buffered
+        assert buffer.get_pending_count() == 1
+        with buffer._lock, buffer._get_connection() as conn:
+            row = conn.execute("SELECT event_id FROM outbound_events;").fetchone()
+            assert row["event_id"] == ev_future["event_id"]
+
     finally:
         server.should_exit = True
         server_thread.join(timeout=2.0)

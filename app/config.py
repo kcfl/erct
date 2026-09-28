@@ -38,6 +38,8 @@ class SimulationConfig(BaseModel):
     candidates_per_centre: int = 40
     heartbeat_interval_s: int = 2
     flaky_fraction: float = 0.1
+    seed: int = 36
+    restore_boot_delay_s: List[float] = Field(default_factory=lambda: [2.0, 20.0])
     faults: List[FaultConfig] = Field(default_factory=list)
 
 

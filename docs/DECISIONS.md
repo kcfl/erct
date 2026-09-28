@@ -129,3 +129,13 @@ First match wins, strictly evaluated in order **R3 -> R4 -> R1 -> R2**:
 - **Hour 11–13:** Phase 4: Ops Control Tower dashboard (SSE) + Candidate status page + Report export.
 - **Hour 13:** **CODE FREEZE** — End-to-end demo hardening, video recording, single-command validation.
 - **Hour 14–18:** Phase 5 & 6 polish, optional modules with offline labels, slides, and submission packaging.
+
+---
+
+## 11. Phase 3a-i Data Layer Hardening Decisions
+- **Dual-Clock Architecture:** Outage detection measures silence using server receive time (`ingested_at`), while impact duration is calculated from event source time (`ts`). When buffered backlogs arrive late with `ts` falling into an outage window, incidents update retroactively.
+- **Session Monotonicity:** `sessions` table tracks `last_ingested_at` (server UTC receive time). Fields `last_heartbeat_at`, `remaining_s`, and `last_saved_seq` strictly monotonically update only when incoming event `ts >= last_heartbeat_at`. A delayed backlog from a restored network cannot regress or overwrite newer terminal state.
+- **Answer Counter Idempotency:** `answers_saved` increments strictly on newly inserted answer rows (`INSERT OR IGNORE`), ensuring network retransmissions and replays never double count.
+- **Server-Side Centre Liveness:** `centre_liveness(centre_id PRIMARY KEY, last_ingested_at, last_event_ts, events_total)` is maintained atomically in the same database transaction per ingested batch, providing the detector with immediate heartbeat and silence visibility across all centres.
+- **Staggered Reboot Model:** Following `POWER_RESTORED`, the edge agent resumes immediately, while individual candidate workstations stagger reboot over `simulation.restore_boot_delay_s` (range [2, 20] seconds). Delays are deterministically seeded with `Random(f"{seed}:{candidate_id}:{fault_id}")`. Workstations emit zero events while booting, but the exam countdown continues uninterrupted; the first heartbeat post-restore carries the decremented `remaining_s`.
+- **Simulator Ground Truth Isolation:** `data/ground_truth.jsonl` records ground truth upon fault completion (including true downtime `lost_s_true`, unsaved answers at outage inception, and resume timestamps). To maintain absolute evaluative integrity, all modules under `app/` are strictly barred from referencing or importing `ground_truth`, guaranteed by automated CI scanning (`tests/test_ground_truth.py`).

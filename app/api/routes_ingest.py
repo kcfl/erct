@@ -9,10 +9,11 @@ from pydantic import ValidationError
 
 from app.config import get_config
 from app.core.audit_chain import GENESIS_PREV_HASH, append_audit_entry, canonical_json, compute_entry_hash
-from app.db import write_transaction
+from app.db import format_utc_iso, write_transaction
 from app.models.events import BatchIngestResponse, EventEnvelope, EventType
 
 router = APIRouter(prefix="/v1", tags=["Ingestion"])
+HTTP_422 = getattr(status, "HTTP_422_UNPROCESSABLE_CONTENT", 422)
 
 
 def verify_centre_api_key(api_key: Optional[str], event_centre_ids: List[str]) -> None:
@@ -67,7 +68,7 @@ async def ingest_events(
         body = await request.json()
     except Exception:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=HTTP_422,
             detail="Invalid JSON payload in request body",
         )
 
@@ -81,7 +82,7 @@ async def ingest_events(
         raw_items = body
     else:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=HTTP_422,
             detail="Body must be an event object or list of events",
         )
 
@@ -107,7 +108,7 @@ async def ingest_events(
     if rejected_count > 0 and len(validated_events) == 0:
         # If all events failed schema validation, return 422
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=HTTP_422,
             detail={"message": "All events failed schema validation", "errors": errors},
         )
 
@@ -118,7 +119,8 @@ async def ingest_events(
     # 3. Process accepted and duplicate events inside single DB transaction
     accepted_count = 0
     duplicate_count = 0
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_iso = format_utc_iso()
+    centre_stats: Dict[str, Dict[str, Any]] = {}
 
     with write_transaction() as conn:
         cursor = conn.cursor()
@@ -165,48 +167,70 @@ async def ingest_events(
             if cursor.rowcount == 1:
                 accepted_count += 1
 
-                # Update session state if session_id is present
+                # Track per-centre stats for centre_liveness table
+                c_entry = centre_stats.setdefault(ev.centre_id, {"count": 0, "max_ts": ev.ts})
+                c_entry["count"] += 1
+                if ev.ts > c_entry["max_ts"]:
+                    c_entry["max_ts"] = ev.ts
+
+                # Update session state monotonically if session_id is present
                 if ev.session_id:
                     if ev.type == EventType.HEARTBEAT:
                         rem_s = ev.payload.get("remaining_s")
                         cursor.execute(
                             """
                             UPDATE sessions
-                            SET last_heartbeat_at = ?, remaining_s = ?, state = 'active'
+                            SET last_ingested_at = ?,
+                                last_heartbeat_at = CASE WHEN last_heartbeat_at IS NULL OR ? >= last_heartbeat_at THEN ? ELSE last_heartbeat_at END,
+                                remaining_s = CASE WHEN last_heartbeat_at IS NULL OR ? >= last_heartbeat_at THEN ? ELSE remaining_s END,
+                                state = 'active'
                             WHERE session_id = ?;
                             """,
-                            (ev.ts, rem_s, ev.session_id),
+                            (now_iso, ev.ts, ev.ts, ev.ts, rem_s, ev.session_id),
                         )
                     elif ev.type == EventType.ANSWER_SAVED:
                         saved_seq = ev.payload.get("saved_seq", 0)
                         cursor.execute(
                             """
                             UPDATE sessions
-                            SET last_saved_seq = MAX(last_saved_seq, ?),
+                            SET last_ingested_at = ?,
                                 answers_saved = answers_saved + 1,
-                                last_heartbeat_at = ?,
+                                last_saved_seq = CASE WHEN last_heartbeat_at IS NULL OR ? >= last_heartbeat_at THEN MAX(last_saved_seq, ?) ELSE last_saved_seq END,
+                                last_heartbeat_at = CASE WHEN last_heartbeat_at IS NULL OR ? >= last_heartbeat_at THEN ? ELSE last_heartbeat_at END,
                                 state = 'active'
                             WHERE session_id = ?;
                             """,
-                            (saved_seq, ev.ts, ev.session_id),
+                            (now_iso, ev.ts, saved_seq, ev.ts, ev.ts, ev.session_id),
                         )
                     elif ev.type == EventType.SESSION_STARTED:
                         cursor.execute(
                             """
                             UPDATE sessions
-                            SET started_at = ?, state = 'active'
+                            SET last_ingested_at = ?,
+                                started_at = CASE WHEN started_at IS NULL OR ? < started_at THEN ? ELSE started_at END,
+                                state = 'active'
                             WHERE session_id = ?;
                             """,
-                            (ev.ts, ev.session_id),
+                            (now_iso, ev.ts, ev.ts, ev.session_id),
                         )
                     elif ev.type == EventType.SESSION_SUBMITTED:
                         cursor.execute(
                             """
                             UPDATE sessions
-                            SET state = 'submitted'
+                            SET last_ingested_at = ?,
+                                state = 'submitted'
                             WHERE session_id = ?;
                             """,
-                            (ev.session_id,),
+                            (now_iso, ev.session_id),
+                        )
+                    else:
+                        cursor.execute(
+                            """
+                            UPDATE sessions
+                            SET last_ingested_at = ?
+                            WHERE session_id = ?;
+                            """,
+                            (now_iso, ev.session_id),
                         )
 
                 # Prepare audit log row in sequence
@@ -242,6 +266,20 @@ async def ingest_events(
                 VALUES (?, ?, ?, ?, ?, ?, ?);
                 """,
                 audit_inserts,
+            )
+
+        # Update centre_liveness per accepted batch in the same transaction
+        for cid, stats_data in centre_stats.items():
+            cursor.execute(
+                """
+                INSERT INTO centre_liveness (centre_id, last_ingested_at, last_event_ts, events_total)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(centre_id) DO UPDATE SET
+                    last_ingested_at = excluded.last_ingested_at,
+                    last_event_ts = CASE WHEN excluded.last_event_ts > centre_liveness.last_event_ts THEN excluded.last_event_ts ELSE centre_liveness.last_event_ts END,
+                    events_total = centre_liveness.events_total + excluded.events_total;
+                """,
+                (cid, now_iso, stats_data["max_ts"], stats_data["count"]),
             )
 
         cursor.close()

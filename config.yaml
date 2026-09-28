@@ -19,6 +19,9 @@ simulation:
   candidates_per_centre: 40
   heartbeat_interval_s: 2
   flaky_fraction: 0.1
+  seed: 36
+  restore_boot_delay_s: [2, 20]
+  ground_truth_path: "data/ground_truth.jsonl"
   faults:
     - { centre: "C-BPL-02", type: "power_loss", at_s: 300, duration_s: 240, source: "ups", backup_minutes: 0 }
     - { centre: "C-BPL-03", type: "wrong_version" }
