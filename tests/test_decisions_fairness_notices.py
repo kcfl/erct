@@ -1012,17 +1012,17 @@ def test_12_slow_real_processes(tmp_path: Path):
 # SLOW TEST 13: Early fault network_drop at 10s offset with baseline fix
 # ---------------------------------------------------------------------------
 @pytest.mark.slow
-def test_13_slow_early_fault_network(tmp_path: Path):
+@pytest.mark.parametrize("interval_s", [0.5, 2.0])
+def test_13_slow_early_fault_network(tmp_path: Path, interval_s: float):
     """Early fault: network_drop at C-BPL-04 with start offset 10 s.
     All exposed sessions are listed, every strong row has lost 0, and manual_review share is <= 20%.
+    Tested on both override (0.5s) and real (2.0s) heartbeat intervals.
     """
     port = find_free_port()
-    db_file = tmp_path / "early_net.db"
-    cfg_file = tmp_path / "early_net_cfg.yaml"
-    gt_file = tmp_path / "early_net_gt.jsonl"
-    buf_db = str(tmp_path / "early_net_buf.db")
-
-    interval_s = 0.5
+    db_file = tmp_path / f"early_net_{int(interval_s * 10)}.db"
+    cfg_file = tmp_path / f"early_net_{int(interval_s * 10)}_cfg.yaml"
+    gt_file = tmp_path / f"early_net_{int(interval_s * 10)}_gt.jsonl"
+    buf_db = str(tmp_path / f"early_net_{int(interval_s * 10)}_buf.db")
 
     with open("config.yaml", "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
@@ -1062,7 +1062,8 @@ def test_13_slow_early_fault_network(tmp_path: Path):
 
     try:
         # Run with fault injected at ~10s offset
-        sim_thread = threading.Thread(target=runner.start, kwargs={"duration_s": 18.0}, daemon=True)
+        dur_s = 22.0 if interval_s >= 2.0 else 18.0
+        sim_thread = threading.Thread(target=runner.start, kwargs={"duration_s": dur_s}, daemon=True)
         sim_thread.start()
 
         time.sleep(10.0)  # 10s offset
@@ -1073,7 +1074,7 @@ def test_13_slow_early_fault_network(tmp_path: Path):
             timeout=2.0,
         )
 
-        sim_thread.join(timeout=25.0)
+        sim_thread.join(timeout=35.0)
         runner.buffer.drain_all(api_base_url=base_url)
         time.sleep(0.5)
 

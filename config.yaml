@@ -20,6 +20,7 @@ simulation:
   heartbeat_interval_s: 2
   flaky_fraction: 0.1
   seed: 36
+  answer_before_heartbeat: true
   restore_boot_delay_s: [2, 20]
   ground_truth_path: "data/ground_truth.jsonl"
   faults:
@@ -107,7 +108,7 @@ integrity:
 impact:
   heartbeat_interval_s: 2.0      # expected cadence, must match the simulator
   loss_gap_factor: 5             # a gap between consecutive heartbeats longer than factor * interval is real loss, shorter is noise
-  stale_hb_factor: 2.5           # last heartbeat older than factor*interval before window_start => evidence partial
+  stale_hb_factor: 1.8           # last heartbeat older than factor*interval before window_start => evidence partial
   baseline_slots: 10             # interval slots before window_start used to judge heartbeat regularity
   baseline_missing_max: 0.2      # more missing slots than this => evidence partial
   baseline_min_slots: 3          # minimum required slots after session start

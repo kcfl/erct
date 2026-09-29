@@ -28,7 +28,7 @@ def seed_database(db_path: str = None) -> Dict[str, int]:
     cfg = get_config()
     exam = cfg.exam
     config_hash = hashlib.sha256(exam.id.encode()).hexdigest()[:16]
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_iso = "2026-09-29T00:00:00+00:00"
 
     counts = {"exams": 0, "centres": 0, "candidates": 0, "sessions": 0}
 

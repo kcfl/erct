@@ -187,14 +187,13 @@ def compute_session_facts(
         is_partial = False
         reasons = []
 
-        # Stale check: if last heartbeat older than 1.8 * interval before window_start,
+        # Stale check: if last heartbeat older than stale_factor * interval before window_start,
         # telemetry at fault inception is unobserved and potentially desynchronized
         stale_s = (ws_dt - last_good_dt).total_seconds() if ws_dt and last_good_dt else 0.0
-        effective_stale_factor = min(stale_factor, 1.8)
         quality_details["stale_seconds"] = round(stale_s, 2)
-        if stale_s > effective_stale_factor * interval:
+        if stale_s > stale_factor * interval:
             is_partial = True
-            reasons.append(f"last_good_ts stale ({round(stale_s, 1)}s > {round(effective_stale_factor * interval, 1)}s)")
+            reasons.append(f"last_good_ts stale ({round(stale_s, 1)}s > {round(stale_factor * interval, 1)}s)")
 
         # Local seq check
         if L is None:
@@ -203,17 +202,23 @@ def compute_session_facts(
 
         # Baseline regularity check
         if ws_dt:
-            # Slots = the last baseline_slots interval slots before window_start,
-            # clipped to the session start
             session_started_at = session.get("started_at")
             started_dt = parse_iso(session_started_at) if session_started_at else None
 
+            # Align slots against started_at forward up to window_start
             available_slots = []
-            for slot_idx in range(baseline_slots_count):
-                slot_t0 = ws_dt - timedelta(seconds=(baseline_slots_count - slot_idx) * interval)
-                slot_t1 = ws_dt - timedelta(seconds=(baseline_slots_count - slot_idx - 1) * interval)
-                # Clip to session start: slot must be at or after the session's started_at
-                if started_dt is None or slot_t0 >= (started_dt - timedelta(seconds=1e-4)):
+            if started_dt:
+                total_time_s = (ws_dt - started_dt).total_seconds()
+                total_slots = int(total_time_s // interval)
+                start_slot_idx = max(0, total_slots - baseline_slots_count)
+                for slot_idx in range(start_slot_idx, total_slots):
+                    slot_t0 = started_dt + timedelta(seconds=slot_idx * interval)
+                    slot_t1 = started_dt + timedelta(seconds=(slot_idx + 1) * interval)
+                    available_slots.append((slot_t0, slot_t1))
+            else:
+                for slot_idx in range(baseline_slots_count):
+                    slot_t0 = ws_dt - timedelta(seconds=(baseline_slots_count - slot_idx) * interval)
+                    slot_t1 = ws_dt - timedelta(seconds=(baseline_slots_count - slot_idx - 1) * interval)
                     available_slots.append((slot_t0, slot_t1))
 
             baseline_min_slots = getattr(cfg.impact, "baseline_min_slots", 3)
@@ -225,7 +230,13 @@ def compute_session_facts(
                 quality_details["missing_fraction"] = 1.0
             else:
                 missing_slots = 0
+                first_hb_dt = pre_window_hbs[0]["ts_dt"] if pre_window_hbs else None
+
                 for slot_t0, slot_t1 in available_slots:
+                    # Slot before first heartbeat does not count as missing
+                    if first_hb_dt and slot_t1 <= first_hb_dt:
+                        continue
+
                     slot_has_hb = any(
                         slot_t0 < hb["ts_dt"] <= slot_t1
                         for hb in pre_window_hbs
@@ -233,15 +244,16 @@ def compute_session_facts(
                     if not slot_has_hb:
                         missing_slots += 1
 
+                allowed_missing = int(math.floor(baseline_missing_max * len(available_slots)))
                 missing_frac = missing_slots / len(available_slots)
                 quality_details["baseline_slots"] = len(available_slots)
                 quality_details["missing_slots"] = missing_slots
                 quality_details["missing_fraction"] = round(missing_frac, 2)
 
-                if missing_frac > baseline_missing_max:
+                if missing_slots > allowed_missing:
                     is_partial = True
                     reasons.append(
-                        f"baseline missing slots {missing_slots}/{len(available_slots)} ({round(missing_frac * 100, 1)}%) > {round(baseline_missing_max * 100, 1)}%"
+                        f"baseline missing slots {missing_slots}/{len(available_slots)} ({round(missing_frac * 100, 1)}%) > {allowed_missing} allowed"
                     )
 
         if is_partial:

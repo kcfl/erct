@@ -719,15 +719,23 @@ class SimulatorRunner:
                 )
 
         # Candidate Answers and Heartbeats
+        ans_before_hb = getattr(self.cfg.simulation, "answer_before_heartbeat", True)
         for client in self.candidate_clients:
             cid = client.centre_id
-            ans = client.advance_answer()
-            if ans:
-                events_by_centre[cid].append(ans)
-
-            hb = client.tick_heartbeat(self.heartbeat_interval_s, clock_speed=self.exam_clock_speed)
-            if hb:
-                events_by_centre[cid].append(hb)
+            if ans_before_hb:
+                ans = client.advance_answer()
+                if ans:
+                    events_by_centre[cid].append(ans)
+                hb = client.tick_heartbeat(self.heartbeat_interval_s, clock_speed=self.exam_clock_speed)
+                if hb:
+                    events_by_centre[cid].append(hb)
+            else:
+                hb = client.tick_heartbeat(self.heartbeat_interval_s, clock_speed=self.exam_clock_speed)
+                if hb:
+                    events_by_centre[cid].append(hb)
+                ans = client.advance_answer()
+                if ans:
+                    events_by_centre[cid].append(ans)
 
         # Check pending power-loss ground-truth completion
         self._check_ground_truth_completion(force=False)
