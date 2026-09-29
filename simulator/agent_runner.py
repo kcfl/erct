@@ -562,11 +562,11 @@ class SimulatorRunner:
                 cl.on_fault_start(fault_type="power_loss", fault_id=fault_id)
 
         elif fault_type == "network_drop":
-            # Edge agent emits NETWORK_DOWN into buffer, then pauses delivery
+            # Edge agent pauses delivery first, then emits NETWORK_DOWN into buffer
+            self.buffer.pause_centre(centre_id)
             nd_ev = c_agent.generate_network_down()
             af.start_ts = nd_ev.ts
             self.buffer.enqueue(nd_ev, centre_id, c_agent.api_key)
-            self.buffer.pause_centre(centre_id)
             for cl in af.candidates_snapshot:
                 cl.on_fault_start(fault_type="network_drop", fault_id=fault_id)
 

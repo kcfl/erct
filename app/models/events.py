@@ -1,6 +1,7 @@
 """Event envelope and payload validation models adhering strictly to PRD Part 3."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import uuid
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
@@ -42,6 +43,19 @@ class EventEnvelope(BaseModel):
     type: EventType = Field(description="Standardized event type")
     severity: Severity = Field(default=Severity.INFO, description="Event severity level")
     payload: Dict[str, Any] = Field(default_factory=dict, description="Event payload dictionary")
+
+    @field_validator("ts")
+    @classmethod
+    def validate_and_normalize_ts(cls, v: str) -> str:
+        s = str(v).strip()
+        try:
+            dt = datetime.fromisoformat(s)
+        except Exception as e:
+            raise ValueError(f"Invalid ISO-8601 timestamp '{v}': {e}") from e
+        if dt.tzinfo is None:
+            raise ValueError(f"Naive timestamp rejected; must include timezone offset: '{v}'")
+        dt_utc = dt.astimezone(timezone.utc)
+        return dt_utc.strftime("%Y-%m-%dT%H:%M:%S.%f+00:00")
 
     @field_validator("event_id")
     @classmethod

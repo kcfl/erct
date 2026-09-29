@@ -124,6 +124,20 @@ CREATE TABLE IF NOT EXISTS incidents (
     evidence TEXT
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_incidents_active_centre
+ON incidents(exam_id, centre_id)
+WHERE status IN ('open', 'recovering');
+
+CREATE TABLE IF NOT EXISTS incident_timeline (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_id TEXT NOT NULL REFERENCES incidents(incident_id),
+    ts TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    detail TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_incident_timeline_inc ON incident_timeline(incident_id, ts);
+
 CREATE TABLE IF NOT EXISTS incident_impacts (
     incident_id TEXT REFERENCES incidents(incident_id),
     candidate_id TEXT REFERENCES candidates(candidate_id),
@@ -270,3 +284,9 @@ def init_db(db_path: Optional[str] = None) -> None:
     """Initialize database schema if tables do not exist."""
     with write_transaction(db_path) as conn:
         conn.executescript(SCHEMA_DDL)
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(sessions);")
+        cols = {row["name"] for row in cursor.fetchall()}
+        if cols and "last_ingested_at" not in cols:
+            cursor.execute("ALTER TABLE sessions ADD COLUMN last_ingested_at TEXT;")
+        cursor.close()

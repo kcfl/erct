@@ -182,8 +182,7 @@ async def ingest_events(
                             UPDATE sessions
                             SET last_ingested_at = ?,
                                 last_heartbeat_at = CASE WHEN last_heartbeat_at IS NULL OR ? >= last_heartbeat_at THEN ? ELSE last_heartbeat_at END,
-                                remaining_s = CASE WHEN last_heartbeat_at IS NULL OR ? >= last_heartbeat_at THEN ? ELSE remaining_s END,
-                                state = 'active'
+                                remaining_s = CASE WHEN last_heartbeat_at IS NULL OR ? >= last_heartbeat_at THEN ? ELSE remaining_s END
                             WHERE session_id = ?;
                             """,
                             (now_iso, ev.ts, ev.ts, ev.ts, rem_s, ev.session_id),
@@ -195,12 +194,10 @@ async def ingest_events(
                             UPDATE sessions
                             SET last_ingested_at = ?,
                                 answers_saved = answers_saved + 1,
-                                last_saved_seq = CASE WHEN last_heartbeat_at IS NULL OR ? >= last_heartbeat_at THEN MAX(last_saved_seq, ?) ELSE last_saved_seq END,
-                                last_heartbeat_at = CASE WHEN last_heartbeat_at IS NULL OR ? >= last_heartbeat_at THEN ? ELSE last_heartbeat_at END,
-                                state = 'active'
+                                last_saved_seq = MAX(last_saved_seq, ?)
                             WHERE session_id = ?;
                             """,
-                            (now_iso, ev.ts, saved_seq, ev.ts, ev.ts, ev.session_id),
+                            (now_iso, saved_seq, ev.session_id),
                         )
                     elif ev.type == EventType.SESSION_STARTED:
                         cursor.execute(
@@ -208,17 +205,18 @@ async def ingest_events(
                             UPDATE sessions
                             SET last_ingested_at = ?,
                                 started_at = CASE WHEN started_at IS NULL OR ? < started_at THEN ? ELSE started_at END,
-                                state = 'active'
+                                last_heartbeat_at = CASE WHEN last_heartbeat_at IS NULL OR ? >= last_heartbeat_at THEN ? ELSE last_heartbeat_at END,
+                                state = CASE WHEN state IN ('interrupted', 'under_review') THEN state ELSE 'active' END
                             WHERE session_id = ?;
                             """,
-                            (now_iso, ev.ts, ev.ts, ev.session_id),
+                            (now_iso, ev.ts, ev.ts, ev.ts, ev.ts, ev.session_id),
                         )
                     elif ev.type == EventType.SESSION_SUBMITTED:
                         cursor.execute(
                             """
                             UPDATE sessions
                             SET last_ingested_at = ?,
-                                state = 'submitted'
+                                state = CASE WHEN state IN ('interrupted', 'under_review') THEN state ELSE 'submitted' END
                             WHERE session_id = ?;
                             """,
                             (now_iso, ev.session_id),

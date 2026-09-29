@@ -36,18 +36,23 @@ class StoreAndForwardBuffer:
         self.buffer_db_path = Path(buffer_db_path)
         self.buffer_db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._local = threading.local()
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.buffer_db_path), timeout=15.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode = WAL;")
-        conn.execute("PRAGMA synchronous = NORMAL;")
-        conn.execute("PRAGMA busy_timeout = 5000;")
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(str(self.buffer_db_path), timeout=15.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode = WAL;")
+            conn.execute("PRAGMA synchronous = NORMAL;")
+            conn.execute("PRAGMA busy_timeout = 5000;")
+            self._local.conn = conn
         return conn
 
     def _init_db(self) -> None:
-        with self._lock, self._get_connection() as conn:
+        with self._lock:
+            conn = self._get_connection()
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS outbound_events (
@@ -67,6 +72,9 @@ class StoreAndForwardBuffer:
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_outbound_centre ON outbound_events(centre_id);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outbound_centre_retry ON outbound_events(centre_id, next_retry_at, id);"
             )
 
             conn.execute(
@@ -217,10 +225,10 @@ class StoreAndForwardBuffer:
         self,
         api_base_url: str = "http://127.0.0.1:8000",
         max_batch_size: int = 500,
-        timeout: float = 5.0,
+        timeout: float = 10.0,
         client: Optional[httpx.Client] = None,
     ) -> Dict[str, int]:
-        """Dispatch up to max_batch_size oldest eligible events to the ingestion API.
+        """Dispatch up to max_batch_size oldest eligible events per centre to the ingestion API.
 
         - Skips centres that are currently paused.
         - 200/208: removes confirmed events.
@@ -232,47 +240,68 @@ class StoreAndForwardBuffer:
 
         paused_centres = self.get_paused_centres()
 
-        # Step 1: Select eligible rows under lock and temporarily mark them in-flight
+        # Step 1: Select eligible centres with pending events
         with self._lock:
-            with self._get_connection() as conn:
-                if paused_centres:
-                    placeholders = ",".join("?" for _ in paused_centres)
-                    query = f"""
-                        SELECT id, event_id, centre_id, api_key, event_json, attempts
-                        FROM outbound_events
-                        WHERE next_retry_at <= ? AND centre_id NOT IN ({placeholders})
-                        ORDER BY id ASC
-                        LIMIT ?;
+            conn = self._get_connection()
+            if paused_centres:
+                placeholders = ",".join("?" for _ in paused_centres)
+                query = f"""
+                    SELECT DISTINCT centre_id, api_key
+                    FROM outbound_events
+                    WHERE next_retry_at <= ? AND centre_id NOT IN ({placeholders})
+                    LIMIT 10;
+                """
+                params = [now_iso] + list(paused_centres)
+            else:
+                query = """
+                    SELECT DISTINCT centre_id, api_key
+                    FROM outbound_events
+                    WHERE next_retry_at <= ?
+                    LIMIT 10;
+                """
+                params = [now_iso]
+
+            cursor = conn.execute(query, params)
+            eligible_centres = cursor.fetchall()
+
+            if not eligible_centres:
+                return stats
+
+            # Fetch batches of up to max_batch_size oldest events per eligible centre
+            batches: List[Dict[str, Any]] = []
+            for c_row in eligible_centres:
+                cid = c_row["centre_id"]
+                key = c_row["api_key"]
+                c_events = conn.execute(
                     """
-                    params = [now_iso] + list(paused_centres) + [max_batch_size]
-                else:
-                    query = """
-                        SELECT id, event_id, centre_id, api_key, event_json, attempts
-                        FROM outbound_events
-                        WHERE next_retry_at <= ?
-                        ORDER BY id ASC
-                        LIMIT ?;
-                    """
-                    params = [now_iso, max_batch_size]
+                    SELECT id, event_id, centre_id, api_key, event_json, attempts
+                    FROM outbound_events
+                    WHERE next_retry_at <= ? AND centre_id = ?
+                    ORDER BY id ASC
+                    LIMIT ?;
+                    """,
+                    (now_iso, cid, max_batch_size),
+                ).fetchall()
+                if c_events:
+                    batches.append({
+                        "centre_id": cid,
+                        "api_key": key,
+                        "rows": c_events,
+                    })
 
-                cursor = conn.execute(query, params)
-                rows = cursor.fetchall()
+        if not batches:
+            return stats
 
-                if not rows:
-                    return stats
-
-        # Step 2: Group rows by (centre_id, api_key) and dispatch over HTTP (NO LOCK HELD)
-        batches: Dict[tuple, List[sqlite3.Row]] = {}
-        for r in rows:
-            key = (r["centre_id"], r["api_key"])
-            batches.setdefault(key, []).append(r)
-
+        # Step 2: Dispatch over HTTP without holding lock
         target_url = f"{api_base_url.rstrip('/')}/v1/events"
         own_client = client is None
         http_client = client or httpx.Client(timeout=timeout)
 
         try:
-            for (centre_id, api_key), batch_rows in batches.items():
+            for b in batches:
+                centre_id = b["centre_id"]
+                api_key = b["api_key"]
+                batch_rows = b["rows"]
                 parsed_events = [json.loads(r["event_json"]) for r in batch_rows]
                 row_ids = [r["id"] for r in batch_rows]
                 event_ids = [r["event_id"] for r in batch_rows]
@@ -292,7 +321,8 @@ class StoreAndForwardBuffer:
                         stats["duplicates"] += data.get("duplicates", 0)
                         stats["dispatched"] += len(batch_rows)
 
-                        with self._lock, self._get_connection() as conn:
+                        with self._lock:
+                            conn = self._get_connection()
                             placeholders = ",".join("?" for _ in row_ids)
                             conn.execute(
                                 f"DELETE FROM outbound_events WHERE id IN ({placeholders});",
@@ -307,7 +337,8 @@ class StoreAndForwardBuffer:
                             (eid, centre_id, ejson, error_detail, now_dl)
                             for eid, ejson in zip(event_ids, event_jsons)
                         ]
-                        with self._lock, self._get_connection() as conn:
+                        with self._lock:
+                            conn = self._get_connection()
                             conn.executemany(
                                 """
                                 INSERT INTO dead_letter (event_id, centre_id, event_json, error_detail, failed_at)

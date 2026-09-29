@@ -3,16 +3,19 @@ from __future__ import annotations
 
 import hashlib
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from typing import Any, Dict
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, Optional
 from fastapi import FastAPI, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes_ingest import router as ingest_router
 from app.api.routes_control import router as control_router
+from app.api.routes_centres import router as centres_router
+from app.api.routes_incidents import router as incidents_router
 from app.config import get_config
 from app.core.audit_chain import append_audit_entry, verify_audit_chain
-from app.db import get_db_connection, init_db, write_transaction
+from app.core.detection import DetectionEngine, DetectionWorker, parse_utc_iso
+from app.db import format_utc_iso, get_db_connection, init_db, write_transaction
 
 
 def seed_database(db_path: str = None) -> Dict[str, int]:
@@ -122,10 +125,29 @@ def seed_database(db_path: str = None) -> Dict[str, int]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifespan handler for database initialization and deterministic seed."""
+    """Lifespan handler for database initialization, deterministic seed, and detection engine worker."""
     init_db()
     seed_database()
-    yield
+
+    cfg = get_config()
+    engine = DetectionEngine()
+    app.state.detection_engine = engine
+
+    # Run initial tick on startup so telemetry is available immediately
+    try:
+        engine.tick(datetime.now(timezone.utc))
+    except Exception:
+        pass
+
+    worker = DetectionWorker(engine, tick_s=cfg.detection.tick_s)
+    app.state.detection_worker = worker
+    worker.start()
+
+    try:
+        yield
+    finally:
+        worker.running = False
+        worker.join(timeout=2.0)
 
 
 app = FastAPI(
@@ -146,12 +168,45 @@ app.add_middleware(
 # Register API routes
 app.include_router(ingest_router)
 app.include_router(control_router)
+app.include_router(centres_router)
+app.include_router(incidents_router)
 
 
 @app.get("/v1/health", status_code=status.HTTP_200_OK)
 def get_health() -> Dict[str, Any]:
-    """System health check and quick status summary."""
+    """System health check and quick status summary including detection telemetry."""
     cfg = get_config()
+    now = datetime.now(timezone.utc)
+    engine: Optional[DetectionEngine] = getattr(app.state, "detection_engine", None)
+
+    health_status = "healthy"
+    detection_telemetry = {
+        "last_tick_at": None,
+        "ticks": 0,
+        "tick_errors": 0,
+        "grace_remaining_s": 0.0,
+        "ingest_stalled": False,
+    }
+
+    if engine:
+        last_tick_at = engine.last_tick_at
+        grace_rem = max(0.0, (engine.started_at + timedelta(seconds=cfg.detection.startup_grace_s) - now).total_seconds())
+        detection_telemetry = {
+            "last_tick_at": last_tick_at,
+            "ticks": engine.ticks,
+            "tick_errors": engine.tick_errors,
+            "grace_remaining_s": round(grace_rem, 2),
+            "ingest_stalled": engine.ingest_stalled,
+        }
+        if not last_tick_at:
+            health_status = "degraded"
+        else:
+            tick_age = (now - parse_utc_iso(last_tick_at)).total_seconds()
+            if tick_age > 5.0:
+                health_status = "degraded"
+    else:
+        health_status = "degraded"
+
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) AS c FROM events;")
@@ -165,7 +220,7 @@ def get_health() -> Dict[str, Any]:
     audit_res = verify_audit_chain()
 
     return {
-        "status": "healthy",
+        "status": health_status,
         "exam_id": cfg.exam.id,
         "centres_count": centres_count,
         "candidates_count": candidates_count,
@@ -173,5 +228,6 @@ def get_health() -> Dict[str, Any]:
         "audit_chain_ok": audit_res.ok,
         "audit_head_hash": audit_res.head_hash,
         "total_audit_entries": audit_res.total_entries,
-        "server_time": datetime.now(timezone.utc).isoformat(),
+        "server_time": format_utc_iso(now),
+        "detection": detection_telemetry,
     }

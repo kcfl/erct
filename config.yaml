@@ -81,6 +81,16 @@ readiness:
     capacity: 30
 
 detection:
+  tick_s: 1.0
+  startup_grace_s: 15
+  min_active_sessions: 5
+  close_fraction: 0.2
+  close_ticks: 2
+  recovery_resume_fraction: 0.9
+  recovery_max_wait_s: 30
+  settle_s: 5
+  escalate_after_s: 120
+  ingest_stall_s: 8
   heartbeat_gap_s: 6
   centre_loss_fraction: 0.6         # 60% of sessions silent within window calls centre outage
   centre_loss_window_s: 10          # Detection window in seconds

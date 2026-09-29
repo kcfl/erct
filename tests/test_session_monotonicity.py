@@ -336,3 +336,234 @@ def test_centre_liveness_updated_per_batch(running_server: Dict[str, Any]):
         live_row2 = conn.execute("SELECT * FROM centre_liveness WHERE centre_id = 'C-BPL-01';").fetchone()
         assert live_row2["events_total"] == 5
         assert live_row2["last_event_ts"] == ts3
+
+
+def test_last_saved_seq_independent_of_ts(running_server: Dict[str, Any]):
+    """Rule 1b-2: last_saved_seq must use MAX(old, new) independent of ts."""
+    base_url = running_server["base_url"]
+    db_path = running_server["db_path"]
+    session_id = "SES-000001-1"
+    headers = {"X-API-Key": "key-cbpl01-secret", "Content-Type": "application/json"}
+
+    # Seed session with last_saved_seq = 5, last_heartbeat_at = 10:05:00
+    with get_db_connection(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE sessions
+            SET last_saved_seq = 5,
+                last_heartbeat_at = '2026-09-29T10:05:00.000000+00:00',
+                answers_saved = 5
+            WHERE session_id = ?;
+            """,
+            (session_id,),
+        )
+        conn.commit()
+
+    # Send an ANSWER_SAVED with an older timestamp (10:01:00) but higher saved_seq (12)
+    ev = {
+        "event_id": str(uuid.uuid4()),
+        "schema_ver": 1,
+        "ts": "2026-09-29T10:01:00.000000+00:00",
+        "exam_id": "EX-2026-PS6-01",
+        "centre_id": "C-BPL-01",
+        "candidate_id": "CAND-000001",
+        "session_id": session_id,
+        "seq": 10,
+        "type": "ANSWER_SAVED",
+        "payload": {
+            "question_id": "Q-SEQ-TEST",
+            "answer_hash": "a1b2c3d4",
+            "saved_seq": 12,
+        },
+    }
+
+    r = httpx.post(f"{base_url}/v1/events", json=ev, headers=headers)
+    assert r.status_code == 200
+
+    with get_db_connection(db_path) as conn:
+        row = conn.execute("SELECT last_saved_seq, answers_saved FROM sessions WHERE session_id = ?;", (session_id,)).fetchone()
+        assert row["last_saved_seq"] == 12, f"Expected last_saved_seq=12, got {row['last_saved_seq']}"
+        assert row["answers_saved"] == 6
+
+
+def test_last_heartbeat_at_isolated_from_answer_saved(running_server: Dict[str, Any]):
+    """Rule 1b-3: last_heartbeat_at may only be set by HEARTBEAT or SESSION_STARTED events."""
+    base_url = running_server["base_url"]
+    db_path = running_server["db_path"]
+    session_id = "SES-000001-1"
+    headers = {"X-API-Key": "key-cbpl01-secret", "Content-Type": "application/json"}
+
+    hb_ts = "2026-09-29T10:05:00.000000+00:00"
+    with get_db_connection(db_path) as conn:
+        conn.execute(
+            "UPDATE sessions SET last_heartbeat_at = ? WHERE session_id = ?;",
+            (hb_ts, session_id),
+        )
+        conn.commit()
+
+    # Send ANSWER_SAVED with much newer timestamp (10:15:00)
+    ev_ans = {
+        "event_id": str(uuid.uuid4()),
+        "schema_ver": 1,
+        "ts": "2026-09-29T10:15:00.000000+00:00",
+        "exam_id": "EX-2026-PS6-01",
+        "centre_id": "C-BPL-01",
+        "candidate_id": "CAND-000001",
+        "session_id": session_id,
+        "seq": 20,
+        "type": "ANSWER_SAVED",
+        "payload": {
+            "question_id": "Q-HB-TEST",
+            "answer_hash": "a1b2c3d4",
+            "saved_seq": 15,
+        },
+    }
+    r = httpx.post(f"{base_url}/v1/events", json=ev_ans, headers=headers)
+    assert r.status_code == 200
+
+    with get_db_connection(db_path) as conn:
+        row = conn.execute("SELECT last_heartbeat_at FROM sessions WHERE session_id = ?;", (session_id,)).fetchone()
+        assert row["last_heartbeat_at"] == hb_ts, "ANSWER_SAVED must NOT update last_heartbeat_at"
+
+
+def test_ingest_path_never_moves_out_of_interrupted_or_under_review(running_server: Dict[str, Any]):
+    """Rule 1b-4: The ingest path must never move a session out of 'interrupted' or 'under_review'."""
+    base_url = running_server["base_url"]
+    db_path = running_server["db_path"]
+    headers = {"X-API-Key": "key-cbpl01-secret", "Content-Type": "application/json"}
+
+    for protected_state in ("interrupted", "under_review"):
+        session_id = f"SES-000001-1"
+        with get_db_connection(db_path) as conn:
+            conn.execute("UPDATE sessions SET state = ? WHERE session_id = ?;", (protected_state, session_id))
+            conn.commit()
+
+        # Try HEARTBEAT
+        ev_hb = {
+            "event_id": str(uuid.uuid4()),
+            "schema_ver": 1,
+            "ts": "2026-09-29T10:20:00.000000+00:00",
+            "exam_id": "EX-2026-PS6-01",
+            "centre_id": "C-BPL-01",
+            "candidate_id": "CAND-000001",
+            "session_id": session_id,
+            "seq": 30,
+            "type": "HEARTBEAT",
+            "payload": {"latency_ms": 15, "remaining_s": 5000, "local_seq": 1},
+        }
+        httpx.post(f"{base_url}/v1/events", json=ev_hb, headers=headers)
+
+        with get_db_connection(db_path) as conn:
+            row = conn.execute("SELECT state FROM sessions WHERE session_id = ?;", (session_id,)).fetchone()
+            assert row["state"] == protected_state, f"HEARTBEAT moved session out of {protected_state}"
+
+        # Try SESSION_STARTED
+        ev_start = {
+            "event_id": str(uuid.uuid4()),
+            "schema_ver": 1,
+            "ts": "2026-09-29T10:21:00.000000+00:00",
+            "exam_id": "EX-2026-PS6-01",
+            "centre_id": "C-BPL-01",
+            "candidate_id": "CAND-000001",
+            "session_id": session_id,
+            "seq": 31,
+            "type": "SESSION_STARTED",
+            "payload": {"duration_s": 7200},
+        }
+        httpx.post(f"{base_url}/v1/events", json=ev_start, headers=headers)
+
+        with get_db_connection(db_path) as conn:
+            row = conn.execute("SELECT state FROM sessions WHERE session_id = ?;", (session_id,)).fetchone()
+            assert row["state"] == protected_state, f"SESSION_STARTED moved session out of {protected_state}"
+
+        # Try SESSION_SUBMITTED
+        ev_sub = {
+            "event_id": str(uuid.uuid4()),
+            "schema_ver": 1,
+            "ts": "2026-09-29T10:22:00.000000+00:00",
+            "exam_id": "EX-2026-PS6-01",
+            "centre_id": "C-BPL-01",
+            "candidate_id": "CAND-000001",
+            "session_id": session_id,
+            "seq": 32,
+            "type": "SESSION_SUBMITTED",
+            "payload": {},
+        }
+        httpx.post(f"{base_url}/v1/events", json=ev_sub, headers=headers)
+
+        with get_db_connection(db_path) as conn:
+            row = conn.execute("SELECT state FROM sessions WHERE session_id = ?;", (session_id,)).fetchone()
+            assert row["state"] == protected_state, f"SESSION_SUBMITTED moved session out of {protected_state}"
+
+
+def test_timestamp_canonical_order_and_naive_rejection(running_server: Dict[str, Any]):
+    """Step 1c: Rejects naive timestamp with 422; normalizes 'Z' and fractional offsets so real time order holds."""
+    base_url = running_server["base_url"]
+    db_path = running_server["db_path"]
+    session_id = "SES-000001-1"
+    headers = {"X-API-Key": "key-cbpl01-secret", "Content-Type": "application/json"}
+
+    # 1. Naive timestamp must be rejected with 422
+    ev_naive = {
+        "event_id": str(uuid.uuid4()),
+        "schema_ver": 1,
+        "ts": "2026-09-29T10:00:00",  # No timezone offset
+        "exam_id": "EX-2026-PS6-01",
+        "centre_id": "C-BPL-01",
+        "candidate_id": "CAND-000001",
+        "session_id": session_id,
+        "seq": 40,
+        "type": "HEARTBEAT",
+        "payload": {"latency_ms": 20, "remaining_s": 7000, "local_seq": 1},
+    }
+    r_naive = httpx.post(f"{base_url}/v1/events", json=ev_naive, headers=headers)
+    assert r_naive.status_code == 422, f"Expected 422 for naive timestamp, got {r_naive.status_code}"
+
+    # 2. Text vs Time order test:
+    # "2026-09-29T10:00:00.5+00:00" is at 10:00:00.500
+    # "2026-09-29T10:00:00Z" is at 10:00:00.000 (earlier in time, but in raw text 'Z' > '.')
+    # Send the later event first (10:00:00.5):
+    ev_later = {
+        "event_id": str(uuid.uuid4()),
+        "schema_ver": 1,
+        "ts": "2026-09-29T10:00:00.5+00:00",
+        "exam_id": "EX-2026-PS6-01",
+        "centre_id": "C-BPL-01",
+        "candidate_id": "CAND-000001",
+        "session_id": session_id,
+        "seq": 41,
+        "type": "HEARTBEAT",
+        "payload": {"latency_ms": 20, "remaining_s": 6995, "local_seq": 1},
+    }
+    r1 = httpx.post(f"{base_url}/v1/events", json=ev_later, headers=headers)
+    assert r1.status_code == 200
+
+    with get_db_connection(db_path) as conn:
+        row = conn.execute("SELECT last_heartbeat_at, remaining_s FROM sessions WHERE session_id = ?;", (session_id,)).fetchone()
+        assert row["last_heartbeat_at"] == "2026-09-29T10:00:00.500000+00:00"
+        assert row["remaining_s"] == 6995
+
+    # Now send the chronologically earlier event with raw "Z"
+    ev_earlier = {
+        "event_id": str(uuid.uuid4()),
+        "schema_ver": 1,
+        "ts": "2026-09-29T10:00:00Z",
+        "exam_id": "EX-2026-PS6-01",
+        "centre_id": "C-BPL-01",
+        "candidate_id": "CAND-000001",
+        "session_id": session_id,
+        "seq": 42,
+        "type": "HEARTBEAT",
+        "payload": {"latency_ms": 20, "remaining_s": 7000, "local_seq": 1},
+    }
+    r2 = httpx.post(f"{base_url}/v1/events", json=ev_earlier, headers=headers)
+    assert r2.status_code == 200
+
+    # Monotonicity check: the earlier event must NOT overwrite the newer last_heartbeat_at or remaining_s
+    with get_db_connection(db_path) as conn:
+        row = conn.execute("SELECT last_heartbeat_at, remaining_s FROM sessions WHERE session_id = ?;", (session_id,)).fetchone()
+        assert row["last_heartbeat_at"] == "2026-09-29T10:00:00.500000+00:00", (
+            f"Expected 10:00:00.500000+00:00 preserved, got {row['last_heartbeat_at']}"
+        )
+        assert row["remaining_s"] == 6995
+

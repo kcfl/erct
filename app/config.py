@@ -72,6 +72,16 @@ class AnomalyConfig(BaseModel):
 
 
 class DetectionConfig(BaseModel):
+    tick_s: float = 1.0
+    startup_grace_s: float = 15.0
+    min_active_sessions: int = 5
+    close_fraction: float = 0.2
+    close_ticks: int = 2
+    recovery_resume_fraction: float = 0.9
+    recovery_max_wait_s: float = 30.0
+    settle_s: float = 5.0
+    escalate_after_s: float = 120.0
+    ingest_stall_s: float = 8.0
     heartbeat_gap_s: int = 6
     centre_loss_fraction: float = 0.6
     centre_loss_window_s: int = 10
