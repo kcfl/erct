@@ -866,6 +866,9 @@ def test_12_slow_real_processes(tmp_path: Path):
         ground_truth_path=str(gt_file),
     )
 
+    server2 = None
+    server_thread2 = None
+
     try:
         sim_thread = threading.Thread(target=runner.start, kwargs={"duration_s": 17.0}, daemon=True)
         sim_thread.start()
@@ -880,6 +883,8 @@ def test_12_slow_real_processes(tmp_path: Path):
         )
 
         sim_thread.join(timeout=25.0)
+        runner.buffer.drain_all(api_base_url=base_url)
+        time.sleep(1.5)
 
         # Wait for resolution and impact
         inc_id = None
@@ -961,16 +966,14 @@ def test_12_slow_real_processes(tmp_path: Path):
         assert st_m["remedy"]["decision"]["extra_seconds"] == 90
         assert "90 seconds (1 min 30 s)" in st_m["latest_message"]
 
-    finally:
+        # Step 4: Restart API and verify decisions and statuses are unchanged
         server.should_exit = True
         server_thread.join(timeout=3.0)
 
-    # Step 4: Restart API and verify decisions and statuses are unchanged
-    server2 = uvicorn.Server(server_config)
-    server_thread2 = threading.Thread(target=server2.run, daemon=True)
-    server_thread2.start()
+        server2 = uvicorn.Server(server_config)
+        server_thread2 = threading.Thread(target=server2.run, daemon=True)
+        server_thread2.start()
 
-    try:
         for _ in range(30):
             try:
                 if httpx.get(f"{base_url}/v1/health", timeout=0.5).status_code == 200:
@@ -998,8 +1001,11 @@ def test_12_slow_real_processes(tmp_path: Path):
         assert len(decs_after) == app_all_res["approved"] + 1
 
     finally:
-        server2.should_exit = True
-        server_thread2.join(timeout=3.0)
+        server.should_exit = True
+        server_thread.join(timeout=3.0)
+        if server2 is not None:
+            server2.should_exit = True
+            server_thread2.join(timeout=3.0)
         if old_env is not None:
             os.environ["ERCT_CONFIG_PATH"] = old_env
             reload_config(old_env)
@@ -1061,25 +1067,29 @@ def test_13_slow_early_fault_network(tmp_path: Path, interval_s: float):
     )
 
     try:
-        # Run with fault injected at ~10s offset
-        dur_s = 22.0 if interval_s >= 2.0 else 18.0
+        outage_s = 30 if interval_s >= 2.0 else 2
+        dur_s = 58.0 if interval_s >= 2.0 else 18.0
+        offset_s = 10.0
+        boot_delay = cfg["simulation"].get("restore_boot_delay_s", [0.5, 2.0])
+        print(f"\n[TEST_13 VARIANT] interval={interval_s}s | offset={offset_s}s | outage={outage_s}s | boot_delay={boot_delay}")
+
         sim_thread = threading.Thread(target=runner.start, kwargs={"duration_s": dur_s}, daemon=True)
         sim_thread.start()
 
-        time.sleep(10.0)  # 10s offset
+        time.sleep(offset_s)  # 10s offset
         httpx.post(
             f"{base_url}/v1/control/faults",
             headers={"X-Control-Key": "ctrl-secret-key-2026"},
-            json={"centre_id": "C-BPL-04", "fault_type": "network_drop", "duration_s": 2, "params": {}},
+            json={"centre_id": "C-BPL-04", "fault_type": "network_drop", "duration_s": outage_s, "params": {}},
             timeout=2.0,
         )
 
-        sim_thread.join(timeout=35.0)
+        sim_thread.join(timeout=dur_s + 20.0)
         runner.buffer.drain_all(api_base_url=base_url)
-        time.sleep(0.5)
+        time.sleep(2.0)
 
         inc_id = None
-        for _ in range(40):
+        for _ in range(50):
             r = httpx.get(f"{base_url}/v1/incidents?centre_id=C-BPL-04")
             if r.status_code == 200 and r.json():
                 inc = r.json()[0]
@@ -1094,14 +1104,31 @@ def test_13_slow_early_fault_network(tmp_path: Path, interval_s: float):
         rows = imp["rows"]
         assert len(rows) == 40, f"All 40 exposed sessions must be listed, got {len(rows)}"
 
-        # Every strong row has lost 0
+        # Read ground truth
+        assert gt_file.exists(), f"Ground truth file {gt_file} must exist"
+        with open(gt_file, "r", encoding="utf-8") as f_gt:
+            gt_records = [json.loads(line) for line in f_gt if line.strip()]
+        gt_match = next((r for r in gt_records if r["centre_id"] == "C-BPL-04" and r["type"] == "network_drop"), None)
+        assert gt_match is not None, "Ground truth for network_drop on C-BPL-04 must exist"
+        gt_cands = {c["candidate_id"]: c for c in gt_match["candidates"]}
+
+        # Every strong row matches ground truth
         strong_rows = [r for r in rows if r["evidence_quality"] == "strong"]
         for r in strong_rows:
-            assert r["lost_seconds"] == 0, f"Strong row {r['candidate_id']} lost_seconds must be 0, got {r['lost_seconds']}"
+            cid = r["candidate_id"]
+            gt = gt_cands[cid]
+            assert r["lost_seconds"] == 0, f"Strong row {cid} lost_seconds must be 0, got {r['lost_seconds']}"
+            assert abs(r["lost_seconds"] - gt.get("lost_s_from_fault_start", 0.0)) <= 0.1, (
+                f"Candidate {cid} lost_seconds {r['lost_seconds']} != gt {gt.get('lost_s_from_fault_start')}"
+            )
+            assert r["unsaved_answers"] == gt.get("expected_lost_answers", 0), (
+                f"Candidate {cid} unsaved_answers {r['unsaved_answers']} != gt {gt.get('expected_lost_answers')}"
+            )
 
         # Manual review share <= 20%
         manual_rows = [r for r in rows if r["remedy_recommended"] == "manual_review"]
         manual_share = len(manual_rows) / len(rows)
+        print(f"[TEST_13 OUTPUT] interval={interval_s}s: total={len(rows)}, strong={len(strong_rows)}, manual_review={len(manual_rows)} ({manual_share:.1%})")
         assert manual_share <= 0.20, f"Manual review share must be <= 20%, got {manual_share:.1%}"
 
     finally:

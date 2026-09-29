@@ -16,6 +16,7 @@ import json
 import sqlite3
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 from pydantic import BaseModel
 
@@ -380,6 +381,11 @@ def main() -> None:
     )
     parser.add_argument("--inspect", type=int, default=10, help="Show the last N audit entries")
     args = parser.parse_args()
+    if args.db is not None:
+        p = Path(args.db)
+        if not p.exists():
+            print(f"[ERROR] Database file not found: {args.db}")
+            sys.exit(1)
 
     if args.verify:
         result = verify_audit_chain(db_path=args.db)

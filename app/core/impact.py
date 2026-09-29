@@ -205,20 +205,13 @@ def compute_session_facts(
             session_started_at = session.get("started_at")
             started_dt = parse_iso(session_started_at) if session_started_at else None
 
-            # Align slots against started_at forward up to window_start
+            # Baseline slots = up to baseline_slots_count intervals immediately preceding window_start,
+            # clipped to the session started_at
             available_slots = []
-            if started_dt:
-                total_time_s = (ws_dt - started_dt).total_seconds()
-                total_slots = int(total_time_s // interval)
-                start_slot_idx = max(0, total_slots - baseline_slots_count)
-                for slot_idx in range(start_slot_idx, total_slots):
-                    slot_t0 = started_dt + timedelta(seconds=slot_idx * interval)
-                    slot_t1 = started_dt + timedelta(seconds=(slot_idx + 1) * interval)
-                    available_slots.append((slot_t0, slot_t1))
-            else:
-                for slot_idx in range(baseline_slots_count):
-                    slot_t0 = ws_dt - timedelta(seconds=(baseline_slots_count - slot_idx) * interval)
-                    slot_t1 = ws_dt - timedelta(seconds=(baseline_slots_count - slot_idx - 1) * interval)
+            for slot_idx in range(baseline_slots_count):
+                slot_t0 = ws_dt - timedelta(seconds=(baseline_slots_count - slot_idx) * interval)
+                slot_t1 = ws_dt - timedelta(seconds=(baseline_slots_count - slot_idx - 1) * interval)
+                if started_dt is None or slot_t0 >= (started_dt - timedelta(seconds=1e-4)):
                     available_slots.append((slot_t0, slot_t1))
 
             baseline_min_slots = getattr(cfg.impact, "baseline_min_slots", 3)
@@ -230,13 +223,7 @@ def compute_session_facts(
                 quality_details["missing_fraction"] = 1.0
             else:
                 missing_slots = 0
-                first_hb_dt = pre_window_hbs[0]["ts_dt"] if pre_window_hbs else None
-
                 for slot_t0, slot_t1 in available_slots:
-                    # Slot before first heartbeat does not count as missing
-                    if first_hb_dt and slot_t1 <= first_hb_dt:
-                        continue
-
                     slot_has_hb = any(
                         slot_t0 < hb["ts_dt"] <= slot_t1
                         for hb in pre_window_hbs
@@ -608,6 +595,24 @@ def compute_incident_impact(
                 ts_iso=computed_at_iso,
                 conn=conn,
             )
+
+        if has_remedy_changed:
+            cursor.execute(
+                "SELECT decision_id, remedy FROM decisions WHERE incident_id = ? AND candidate_id = ? ORDER BY decision_id DESC LIMIT 1;",
+                (incident_id, cand_id),
+            )
+            prior_dec = cursor.fetchone()
+            if prior_dec:
+                emit_notice(
+                    conn=conn,
+                    audience="admin",
+                    target_id=None,
+                    incident_id=incident_id,
+                    kind="recommendation_changed_after_decision",
+                    ref_key=f"rec_changed:{incident_id}:{cand_id}:{impact_version}",
+                    message=f"recommendation changed after decision: candidate {cand_id} recommended remedy changed from {existing['remedy_recommended']} to {dec.remedy} after decision #{prior_dec['decision_id']} ({prior_dec['remedy']})",
+                    now_iso=computed_at_iso,
+                )
 
         # Candidate notices: impact_pending or review_pending keyed by impact_version
         cand_kind = "review_pending" if dec.remedy == "manual_review" else "impact_pending"

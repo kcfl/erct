@@ -567,3 +567,109 @@ def test_timestamp_canonical_order_and_naive_rejection(running_server: Dict[str,
         )
         assert row["remaining_s"] == 6995
 
+
+# ---------------------------------------------------------------------------
+# TEST 9: STEP 1.4 - SESSION started_at invariant rules
+# ---------------------------------------------------------------------------
+def test_session_started_at_rules(running_server):
+    """STEP 1.4:
+    - a session that has not started is not exposed and not in D
+    - started_at equals the event ts
+    - replaying SESSION_STARTED does not change it (keeps earliest)
+    """
+    base_url = running_server["base_url"]
+    db_path = running_server["db_path"]
+    headers = {"X-API-Key": "key-cbpl03-secret", "Content-Type": "application/json"}
+    session_id = "SES-000099-1"
+    candidate_id = "CAND-000099"
+    centre_id = "C-BPL-03"
+
+    # 1. Unstarted session: seed leaves started_at NULL and state 'registered'
+    with get_db_connection(db_path) as conn:
+        row = conn.execute("SELECT started_at, state FROM sessions WHERE session_id = ?;", (session_id,)).fetchone()
+        assert row["started_at"] is None, f"Seeded session started_at must be NULL, got {row['started_at']}"
+        assert row["state"] == "registered", f"Seeded session state must be registered, got {row['state']}"
+
+    # Verify not in Detection domain D
+    from app.core.detection import DetectionEngine
+    from app.core.impact import compute_incident_impact
+    engine = DetectionEngine(db_path)
+    now_dt = datetime(2026, 9, 29, 10, 0, 0, tzinfo=timezone.utc)
+    engine.reset_start_time(now_dt - timedelta(seconds=60))
+
+    with get_db_connection(db_path) as conn:
+        active_in_d = conn.execute(
+            "SELECT session_id FROM sessions WHERE centre_id = ? AND started_at IS NOT NULL AND state IN ('active', 'resumed', 'interrupted');",
+            (centre_id,),
+        ).fetchall()
+        assert session_id not in [r["session_id"] for r in active_in_d], "Unstarted session must not be in detection domain D"
+
+    # Verify not exposed in impact computation
+    inc_id = "INC-TEST-UNSTARTED-1"
+    ws = "2026-09-29T10:00:30+00:00"
+    we = "2026-09-29T10:01:00+00:00"
+    with get_db_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO incidents (incident_id, exam_id, centre_id, type, severity, status, detected_at, window_start, window_end, resolved_at)
+            VALUES (?, 'EX-2026-PS6-01', ?, 'power', 'high', 'resolved', ?, ?, ?, ?);
+            """,
+            (inc_id, centre_id, ws, ws, we, we),
+        )
+        compute_incident_impact(conn, inc_id, we)
+        impact_cands = [r["candidate_id"] for r in conn.execute("SELECT candidate_id FROM incident_impacts WHERE incident_id = ?;", (inc_id,)).fetchall()]
+        assert candidate_id not in impact_cands, "Unstarted session must NOT be in exposed impact rows"
+
+    # 2. Ingest SESSION_STARTED event at T1
+    t1_iso = "2026-09-29T10:00:15.123456+00:00"
+    ev_start = {
+        "event_id": str(uuid.uuid4()),
+        "schema_ver": 1,
+        "ts": t1_iso,
+        "exam_id": "EX-2026-PS6-01",
+        "centre_id": centre_id,
+        "candidate_id": candidate_id,
+        "session_id": session_id,
+        "seq": 1,
+        "type": "SESSION_STARTED",
+        "severity": "info",
+        "payload": {"duration_s": 7200},
+    }
+    r = httpx.post(f"{base_url}/v1/events", json=ev_start, headers=headers)
+    assert r.status_code == 200
+
+    with get_db_connection(db_path) as conn:
+        row = conn.execute("SELECT started_at, state FROM sessions WHERE session_id = ?;", (session_id,)).fetchone()
+        assert row["started_at"] == t1_iso, f"started_at must equal event ts {t1_iso}, got {row['started_at']}"
+        assert row["state"] == "active"
+
+        # Now in domain D
+        active_in_d = conn.execute(
+            "SELECT session_id FROM sessions WHERE centre_id = ? AND started_at IS NOT NULL AND state IN ('active', 'resumed', 'interrupted');",
+            (centre_id,),
+        ).fetchall()
+        assert session_id in [r["session_id"] for r in active_in_d], "Started session must now be in detection domain D"
+
+    # 3. Replay SESSION_STARTED with a later ts (T2 > T1)
+    t2_iso = "2026-09-29T10:00:25.999999+00:00"
+    ev_replay = {
+        "event_id": str(uuid.uuid4()),
+        "schema_ver": 1,
+        "ts": t2_iso,
+        "exam_id": "EX-2026-PS6-01",
+        "centre_id": centre_id,
+        "candidate_id": candidate_id,
+        "session_id": session_id,
+        "seq": 2,
+        "type": "SESSION_STARTED",
+        "severity": "info",
+        "payload": {"duration_s": 7200},
+    }
+    r_rep = httpx.post(f"{base_url}/v1/events", json=ev_replay, headers=headers)
+    assert r_rep.status_code == 200
+
+    with get_db_connection(db_path) as conn:
+        row = conn.execute("SELECT started_at FROM sessions WHERE session_id = ?;", (session_id,)).fetchone()
+        assert row["started_at"] == t1_iso, f"Replaying SESSION_STARTED must keep earliest {t1_iso}, got {row['started_at']}"
+
+

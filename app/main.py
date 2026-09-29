@@ -89,15 +89,13 @@ def seed_database(db_path: str = None) -> Dict[str, int]:
                     INSERT OR IGNORE INTO sessions (
                         session_id, candidate_id, exam_id, centre_id,
                         started_at, last_heartbeat_at, last_saved_seq, answers_saved, remaining_s, state
-                    ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, 'active');
+                    ) VALUES (?, ?, ?, ?, NULL, NULL, 0, 0, ?, 'registered');
                     """,
                     (
                         session_id,
                         cand_id,
                         exam.id,
                         c.id,
-                        now_iso,
-                        now_iso,
                         exam.duration_min * 60,
                     ),
                 )

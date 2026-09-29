@@ -896,6 +896,12 @@ class DetectionEngine:
                                 )
                                 self.last_late_update_time[inc_id] = now_mono
 
+                            # Recompute all rows when late_events increment within recompute_window_s
+                            recompute_win_s = getattr(getattr(cfg, "impact", None), "recompute_window_s", 600)
+                            res_at_dt = parse_utc_iso(active_inc["resolved_at"]) if active_inc["resolved_at"] else None
+                            if res_at_dt and (now - res_at_dt).total_seconds() <= recompute_win_s:
+                                compute_incident_impact(conn, inc_id, now_iso, cfg)
+
                     tick_summary["incidents_updated"].append(inc_id)
 
                 # 5. Post-resolution Impact Computation & Restart Safety

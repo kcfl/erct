@@ -45,6 +45,9 @@ def fresh_db(tmp_path: Path):
 
     init_db(str(db_file))
     seed_database(str(db_file))
+    with get_db_connection(str(db_file)) as conn:
+        conn.execute("UPDATE sessions SET started_at = '2026-09-29T10:00:00+00:00', state = 'active';")
+        conn.commit()
 
     yield str(db_file)
 

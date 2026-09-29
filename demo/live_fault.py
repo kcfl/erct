@@ -53,6 +53,7 @@ def launch_api_server(cfg_file: Path, port: int) -> subprocess.Popen:
     env["ERCT_CONFIG_PATH"] = str(cfg_file)
     env["PYTHONUNBUFFERED"] = "1"
 
+    log_file = Path("data/api_server.log").open("w", encoding="utf-8")
     proc = subprocess.Popen(
         [
             sys.executable,
@@ -67,8 +68,8 @@ def launch_api_server(cfg_file: Path, port: int) -> subprocess.Popen:
             "warning",
         ],
         env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
     )
 
     api_ready = False
@@ -106,6 +107,26 @@ class FaultSpec:
     post_states: Dict[str, int] = None
 
 
+class TeeLogger:
+    def __init__(self, filepath: Path):
+        self.filepath = filepath
+        self.terminal = sys.stdout
+        self.filepath.parent.mkdir(parents=True, exist_ok=True)
+        self.file = open(filepath, "w", encoding="utf-8")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.file.write(message)
+        self.file.flush()
+
+    def flush(self):
+        self.terminal.flush()
+        self.file.flush()
+
+    def close(self):
+        self.file.close()
+
+
 def run_live_demo(
     faults: List[FaultSpec],
     interval_s: float = 2.0,
@@ -113,8 +134,15 @@ def run_live_demo(
     no_fault_duration: float = 60.0,
     controller_flow: bool = False,
 ) -> None:
+    ts_utc = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    fault_desc = "_".join(f"{f.fault_type}_{f.centre_id}" for f in faults) if faults else "clean_run"
+    log_file_path = Path("data/runs") / f"{ts_utc}_{fault_desc}.txt"
+    tee = TeeLogger(log_file_path)
+    old_stdout = sys.stdout
+    sys.stdout = tee
+
     print("=" * 78)
-    print("ERCT LIVE DEMONSTRATION RUNNER (Phase 3b-i)")
+    print("ERCT LIVE DEMONSTRATION RUNNER")
     if faults:
         print("Scheduled Faults:")
         for f in faults:
@@ -153,25 +181,30 @@ def run_live_demo(
 
     def cleanup():
         nonlocal api_proc
-        # Copy to erct.db before cleanup so tamper CLI can inspect it
-        try:
-            import shutil
-            if db_file.exists():
-                shutil.copyfile(str(db_file), "erct.db")
-                Path("data").mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(str(db_file), "data/erct.db")
-                print(f"[DEMO] Preserved demo database to data/erct.db and erct.db for CLI verification/tamper.")
-        except Exception as e:
-            pass
-
         if api_proc is not None:
             print("\n[DEMO] Stopping API server process...")
             api_proc.terminate()
             try:
-                api_proc.wait(timeout=3.0)
+                api_proc.wait(timeout=5.0)
             except Exception:
                 api_proc.kill()
             api_proc = None
+
+        try:
+            import sqlite3
+            if db_file.exists():
+                Path("data").mkdir(parents=True, exist_ok=True)
+                dest_db = Path("data/demo_last_run.db")
+                if dest_db.exists():
+                    try:
+                        dest_db.unlink()
+                    except Exception:
+                        pass
+                with sqlite3.connect(str(db_file)) as src_conn:
+                    src_conn.execute(f"VACUUM INTO '{dest_db.as_posix()}';")
+                print(f"[DEMO] Preserved demo database to data/demo_last_run.db")
+        except Exception as e:
+            print(f"[DEMO] Failed to preserve demo database: {e}")
 
         time.sleep(0.5)
         port_free = is_port_free(port)
@@ -407,6 +440,37 @@ def run_live_demo(
             print(f"    Centre Affected Fraction : {summary.get('centre_affected_fraction')}")
             print(f"    Centre Retest Recommended: {summary.get('centre_retest_recommended')}")
 
+            # (2.b) Distribution of (window_start - last_good_ts) across candidates
+            stale_vals = []
+            for r in rows:
+                ev_str = r.get("evidence")
+                if ev_str:
+                    try:
+                        ev_dict = json.loads(ev_str) if isinstance(ev_str, str) else ev_str
+                        st_s = ev_dict.get("stale_seconds")
+                        if st_s is not None:
+                            stale_vals.append(float(st_s))
+                        elif ev_dict.get("last_good_ts") and inc.get("window_start"):
+                            ws_d = parse_iso(inc["window_start"])
+                            lg_d = parse_iso(ev_dict["last_good_ts"])
+                            stale_vals.append((ws_d - lg_d).total_seconds())
+                    except Exception:
+                        pass
+
+            if stale_vals:
+                min_s = min(stale_vals)
+                med_s = statistics.median(stale_vals)
+                max_s = max(stale_vals)
+                near_limit_c = sum(1 for s in stale_vals if 3.3 <= s <= 3.6)
+                over_limit_c = sum(1 for s in stale_vals if s > 3.6)
+                print(f"\n  (2.b) Staleness Distribution (window_start - last_good_ts) [N={len(stale_vals)}]:")
+                print(f"    Min    : {min_s:.3f} s")
+                print(f"    Median : {med_s:.3f} s")
+                print(f"    Max    : {max_s:.3f} s")
+                print(f"    Count within 0.3s of 3.6s limit (3.3s - 3.6s): {near_limit_c}")
+                if over_limit_c > 0:
+                    print(f"    Count exceeding 3.6s limit (>3.6s)            : {over_limit_c}")
+
             centre_avg_extra[cid] = summary.get("avg_extra_seconds", 0.0)
 
             # (3) Calibration and Oracle numbers against ground truth if present
@@ -470,11 +534,13 @@ def run_live_demo(
                 print(f"      Remedy: {r3_sample['remedy_recommended']} | Quality: {r3_sample['evidence_quality']}")
                 print(f"      Rationale: \"{r3_sample['rationale']}\"")
 
-        # Multi-fault average extra seconds per centre
-        if len(centre_avg_extra) > 1:
-            print("\n  Average Extra Seconds Per Centre (Fairness Benchmark):")
-            for cid, avg_s in centre_avg_extra.items():
+        # Multi-fault average extra seconds per centre (Always printed, also in single-centre runs)
+        print("\n  Average Extra Seconds Per Centre (Fairness Benchmark):")
+        if centre_avg_extra:
+            for cid, avg_s in sorted(centre_avg_extra.items()):
                 print(f"    {cid}: {avg_s:.1f} s")
+        else:
+            print("    No compensation required.")
 
         # (6) Audit Verification & Entry Counts
         with get_db_connection(str(db_file)) as conn:
@@ -692,6 +758,9 @@ def run_live_demo(
 
     finally:
         cleanup()
+        sys.stdout = old_stdout
+        tee.close()
+        print(f"[DEMO] Complete report and log written to: {log_file_path}")
 
 
 def main():

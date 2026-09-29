@@ -62,6 +62,9 @@ def fresh_impact_db(tmp_path: Path):
 
     init_db(str(db_file))
     seed_database(str(db_file))
+    with get_db_connection(str(db_file)) as conn:
+        conn.execute("UPDATE sessions SET started_at = '2026-09-29T09:00:00+00:00', state = 'active';")
+        conn.commit()
 
     yield str(db_file)
 
@@ -662,6 +665,165 @@ def test_08_audit_verification(fresh_impact_db: str):
 
 
 # ---------------------------------------------------------------------------
+# UNIT TEST 8b: Late batch recomputation preserves decisions & emits notice
+# ---------------------------------------------------------------------------
+def test_late_batch_recomputation_preserves_decisions_and_emits_notice(fresh_impact_db: str):
+    """When late events increment within recompute_window_s:
+    1. All rows for the incident are recomputed.
+    2. Changed recommendations append an audit entry of entry_type='impact'.
+    3. Existing controller decisions in the decisions table are preserved.
+    4. An admin notice with 'recommendation changed after decision' is emitted.
+    """
+    db_path = fresh_impact_db
+    now_iso = "2026-09-29T10:05:00+00:00"
+    cfg = get_config()
+
+    with get_db_connection(db_path) as conn:
+        # Create a resolved incident on C-BPL-02
+        conn.execute(
+            """
+            INSERT INTO incidents (incident_id, exam_id, centre_id, type, severity, status, detected_at, window_start, window_end, resolved_at, evidence)
+            VALUES ('INC-LATE-01', 'EX-2026-PS6-01', 'C-BPL-02', 'power', 'critical', 'resolved',
+                    '2026-09-29T10:00:00+00:00', '2026-09-29T10:00:00+00:00', '2026-09-29T10:01:00+00:00', '2026-09-29T10:01:00+00:00',
+                    '{"late_events": 0}');
+            """
+        )
+        # Candidate has regular heartbeats before window_start, but missing resume heartbeat (quality=missing -> manual_review)
+        for i, s_off in enumerate(range(40, 60, 2)):
+            conn.execute(
+                f"""
+                INSERT INTO events (event_id, ts, ingested_at, centre_id, candidate_id, session_id, seq, type, severity, payload)
+                VALUES ('ev-hb-{i}', '2026-09-29T09:59:{s_off:02d}+00:00', '2026-09-29T09:59:{s_off:02d}+00:00', 'C-BPL-02', 'CAND-000041', 'SES-000041-1', {i+1}, 'HEARTBEAT', 'info', '{{"local_seq": {10+i}, "last_save_seq": 5}}');
+                """
+            )
+        conn.commit()
+
+        # 1. Compute initial impact
+        compute_incident_impact(conn, 'INC-LATE-01', now_iso, cfg)
+
+        # Candidate should have manual_review due to missing resume heartbeat
+        row = conn.execute("SELECT remedy_recommended, evidence_quality FROM incident_impacts WHERE incident_id = 'INC-LATE-01' AND candidate_id = 'CAND-000041';").fetchone()
+        assert row["evidence_quality"] == "missing"
+        assert row["remedy_recommended"] == "manual_review"
+
+        # 2. Record a controller decision
+        conn.execute(
+            """
+            INSERT INTO decisions (incident_id, candidate_id, action, remedy, extra_seconds, rule_id, recommended_remedy, impact_version, mode, decided_by, reason, decided_at)
+            VALUES ('INC-LATE-01', 'CAND-000041', 'apply', 'extra_time', 120, 'R2', 'manual_review', 1, 'manual', 'controller_alice', 'Controller granted extra time', '2026-09-29T10:02:00+00:00');
+            """
+        )
+        conn.commit()
+
+        # 3. Late batch of events arrives with a resume heartbeat
+        conn.execute(
+            """
+            INSERT INTO events (event_id, ts, ingested_at, centre_id, candidate_id, session_id, seq, type, severity, payload)
+            VALUES ('ev-hb-late', '2026-09-29T10:01:05+00:00', '2026-09-29T10:06:00+00:00', 'C-BPL-02', 'CAND-000041', 'SES-000041-1', 2, 'HEARTBEAT', 'info', '{"local_seq": 11, "last_save_seq": 5}');
+            """
+        )
+        # Update incident evidence with incremented late_events
+        conn.execute("UPDATE incidents SET evidence = '{\"late_events\": 1}' WHERE incident_id = 'INC-LATE-01';")
+        conn.commit()
+
+        # Trigger impact computation (as DetectionEngine does when late_events increments)
+        compute_incident_impact(conn, 'INC-LATE-01', "2026-09-29T10:06:00+00:00", cfg)
+
+        # Verify candidate row was recomputed to strong and recommendation changed
+        updated_row = conn.execute("SELECT remedy_recommended, evidence_quality, impact_version FROM incident_impacts WHERE incident_id = 'INC-LATE-01' AND candidate_id = 'CAND-000041';").fetchone()
+        assert updated_row["evidence_quality"] == "strong"
+        assert updated_row["remedy_recommended"] != "manual_review"
+        assert updated_row["impact_version"] == 2
+
+        # Verify changed recommendation is audited under entry_type='impact'
+        audit_entries = conn.execute(
+            "SELECT seq, ref_id, json_extract(payload, '$.remedy') AS rem FROM audit_log WHERE entry_type = 'impact' AND ref_id = 'INC-LATE-01:CAND-000041' ORDER BY seq ASC;"
+        ).fetchall()
+        assert len(audit_entries) >= 2, f"Must have at least 2 audit entries for changed recommendation, got {len(audit_entries)}"
+        assert audit_entries[0]["rem"] == "manual_review"
+        assert audit_entries[1]["rem"] == updated_row["remedy_recommended"]
+
+        # Verify decision in decisions table was PRESERVED
+        dec_rows = conn.execute("SELECT * FROM decisions WHERE incident_id = 'INC-LATE-01' AND candidate_id = 'CAND-000041';").fetchall()
+        assert len(dec_rows) == 1
+        assert dec_rows[0]["remedy"] == "extra_time"
+        assert dec_rows[0]["decided_by"] == "controller_alice"
+
+        # Verify admin notice emitted with "recommendation changed after decision"
+        notice = conn.execute(
+            "SELECT * FROM notices WHERE audience = 'admin' AND message LIKE '%recommendation changed after decision%';"
+        ).fetchone()
+        assert notice is not None, "Admin notice with 'recommendation changed after decision' must be emitted"
+
+
+# ---------------------------------------------------------------------------
+# UNIT TEST 8c: Rule R4 fallback with synthetic integrity_flag
+# ---------------------------------------------------------------------------
+def test_rule_r4_fallback_integrity_flag(fresh_impact_db: str):
+    """Rule R4: when integrity_flag is True and centre_affected_fraction >= threshold (0.5),
+    remedy is retest_recommended, extra_seconds is 0, and evidence contains fallback dict
+    with R1 or R2 calculation.
+    """
+    cfg = get_config()
+    # Case A: facts indicate R1 fallback (lost_s <= 300, lost_answers <= 2)
+    facts_r1 = create_dummy_facts(lost_s=10.0, lost_answers=0, quality="strong")
+    incident_facts = {"centre_affected_fraction": 0.8, "integrity_flag": True}
+    dec_r1 = evaluate_remedy(facts_r1, incident_facts, cfg)
+    assert dec_r1.rule_id == "R4"
+    assert dec_r1.remedy == "retest_recommended"
+    assert dec_r1.extra_seconds == 0
+    assert dec_r1.fallback is not None
+    assert dec_r1.fallback["rule_id"] == "R1"
+    assert dec_r1.fallback["remedy"] == "resume"
+    assert dec_r1.fallback["extra_seconds"] == 10
+
+    # Case B: facts indicate R2 fallback (lost_answers > 2)
+    facts_r2 = create_dummy_facts(lost_s=40.0, lost_answers=3, quality="strong")
+    dec_r2 = evaluate_remedy(facts_r2, incident_facts, cfg)
+    assert dec_r2.rule_id == "R4"
+    assert dec_r2.remedy == "retest_recommended"
+    assert dec_r2.extra_seconds == 0
+    assert dec_r2.fallback is not None
+    assert dec_r2.fallback["rule_id"] == "R2"
+    assert dec_r2.fallback["remedy"] == "extra_time"
+    assert dec_r2.fallback["extra_seconds"] == 40 + 120  # 160s
+
+    # Case C: compute_incident_impact with integrity_flag writes fallback into evidence json
+    now_iso = "2026-09-29T10:02:00+00:00"
+    with write_transaction(fresh_impact_db) as conn:
+        conn.execute(
+            """
+            INSERT INTO incidents (incident_id, exam_id, centre_id, type, severity, status, detected_at, window_start, window_end, resolved_at, evidence)
+            VALUES ('INC-R4-01', 'EX-2026-PS6-01', 'C-BPL-02', 'power', 'critical', 'resolved',
+                    '2026-09-29T10:00:00+00:00', '2026-09-29T10:00:00+00:00', '2026-09-29T10:01:00+00:00', '2026-09-29T10:01:00+00:00',
+                    '{"integrity_flag": true}');
+            """
+        )
+        for i, s_off in enumerate(range(40, 60, 2)):
+            conn.execute(
+                f"""
+                INSERT INTO events (event_id, ts, ingested_at, centre_id, candidate_id, session_id, seq, type, severity, payload)
+                VALUES ('ev-r4-hb-{i}', '2026-09-29T09:59:{s_off:02d}+00:00', '2026-09-29T09:59:{s_off:02d}+00:00', 'C-BPL-02', 'CAND-000041', 'SES-000041-1', {i+1}, 'HEARTBEAT', 'info', '{{"local_seq": {10+i}, "last_save_seq": 1}}');
+                """
+            )
+        conn.execute(
+            """
+            INSERT INTO events (event_id, ts, ingested_at, centre_id, candidate_id, session_id, seq, type, severity, payload)
+            VALUES ('ev-r4-2', '2026-09-29T10:01:05+00:00', '2026-09-29T10:01:05+00:00', 'C-BPL-02', 'CAND-000041', 'SES-000041-1', 20, 'HEARTBEAT', 'info', '{"local_seq": 20, "last_save_seq": 1}');
+            """
+        )
+        conn.execute("DELETE FROM sessions WHERE centre_id = 'C-BPL-02' AND candidate_id != 'CAND-000041';")
+        compute_incident_impact(conn, 'INC-R4-01', now_iso, cfg)
+
+        row = conn.execute("SELECT remedy_recommended, rule_id, evidence FROM incident_impacts WHERE incident_id = 'INC-R4-01' AND candidate_id = 'CAND-000041';").fetchone()
+        assert row["rule_id"] == "R4"
+        assert row["remedy_recommended"] == "retest_recommended"
+        ev_json = json.loads(row["evidence"])
+        assert "fallback" in ev_json
+        assert ev_json["fallback"]["rule_id"] in ("R1", "R2")
+
+
+# ---------------------------------------------------------------------------
 # SLOW TEST 9: ACCURACY - Power loss at C-BPL-02 (seed 36)
 # ---------------------------------------------------------------------------
 @pytest.mark.slow
@@ -1068,3 +1230,51 @@ def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+# ---------------------------------------------------------------------------
+# UNIT TEST: Rule R4 Fallback & Weak Evidence Priority
+# ---------------------------------------------------------------------------
+def test_rule_r4_fallback_integrity_flag():
+    """Verify behavior when a candidate has fewer than 3 regular heartbeats (<3 slots available)
+    and the centre simultaneously has an integrity violation (integrity_flag=True, centre_affected_fraction=1.0).
+
+    In the deterministic rule priority hierarchy R3 -> R4 -> R1 -> R2:
+    Rule R3 (Weak Evidence Guard) fires BEFORE Rule R4 is reached.
+    The candidate is assigned 'manual_review' under Rule R3 rather than 'retest_recommended' under R4,
+    because unverified telemetry cannot be safely certified for automated advisory without human review.
+    """
+    cfg = get_config()
+    facts = SessionFacts(
+        session_id="SES-000001-1",
+        candidate_id="CAND-000001",
+        centre_id="C-BPL-01",
+        last_good_ts="2026-09-29T10:00:04+00:00",
+        last_good_dt=datetime(2026, 9, 29, 10, 0, 4, tzinfo=timezone.utc),
+        L=2,
+        last_hb_event_id="hb-2",
+        resume_ts="2026-09-29T10:00:30+00:00",
+        resume_dt=datetime(2026, 9, 29, 10, 0, 30, tzinfo=timezone.utc),
+        resume_hb_event_id="hb-3",
+        gap=26.0,
+        lost_s=26.0,
+        S=1,
+        last_save_event_id="sav-1",
+        lost_answers=1,
+        evidence_quality="partial",
+        quality_details={"reason": "too little history (2 available slots < 3)", "baseline_slots": 2},
+    )
+
+    incident_facts = {
+        "centre_affected_fraction": 1.0,
+        "integrity_flag": True,
+    }
+
+    decision = evaluate_remedy(facts, incident_facts, cfg)
+
+    assert decision.rule_id == "R3", f"Expected rule R3, got {decision.rule_id}"
+    assert decision.remedy == "manual_review", f"Expected manual_review, got {decision.remedy}"
+    assert decision.extra_seconds == 0
+    assert "Evidence quality is 'partial'" in decision.rationale
+    assert "too little history (2 available slots < 3)" in decision.rationale
+
