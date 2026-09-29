@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import get_config
 from app.core.audit_chain import append_audit_entry
+from app.core.impact import compute_incident_impact
 from app.db import format_utc_iso, get_db_connection, resolve_db_path, write_transaction
 
 logger = logging.getLogger("erct.detection")
@@ -317,14 +318,26 @@ class DetectionEngine:
                             (inc_id, now_iso, json.dumps({"rule": trigger_rule, "confidence": trigger_confidence})),
                         )
 
-                        # 3. Set centre's silent sessions to 'interrupted' in the same transaction
-                        silent_sids = [s["session_id"] for s in silent_sessions]
-                        if silent_sids:
-                            placeholders = ",".join("?" for _ in silent_sids)
+                        # 3. Set sessions in D to 'interrupted' in the same transaction
+                        if trigger_rule in ("POWER_LOSS_EVENT", "NETWORK_DOWN_EVENT"):
                             cursor.execute(
-                                f"UPDATE sessions SET state = 'interrupted' WHERE session_id IN ({placeholders});",
-                                silent_sids,
+                                """
+                                UPDATE sessions
+                                SET state = 'interrupted'
+                                WHERE centre_id = ?
+                                  AND started_at IS NOT NULL
+                                  AND state IN ('active', 'resumed');
+                                """,
+                                (cid,),
                             )
+                        else:
+                            silent_sids = [s["session_id"] for s in silent_sessions if s["state"] in ("active", "resumed")]
+                            if silent_sids:
+                                placeholders = ",".join("?" for _ in silent_sids)
+                                cursor.execute(
+                                    f"UPDATE sessions SET state = 'interrupted' WHERE session_id IN ({placeholders}) AND state IN ('active', 'resumed');",
+                                    silent_sids,
+                                )
 
                         # 4. Append audit entry (entry_type = "incident")
                         append_audit_entry(
@@ -374,6 +387,15 @@ class DetectionEngine:
                     evidence["total_sessions"] = D
                     evidence["silent_fraction"] = round(silent_fraction, 3)
 
+                    # While an incident is open or recovering, any further session that turns silent is also set to 'interrupted'
+                    further_silent_sids = [s["session_id"] for s in silent_sessions if s["state"] in ("active", "resumed")]
+                    if further_silent_sids:
+                        placeholders = ",".join("?" for _ in further_silent_sids)
+                        cursor.execute(
+                            f"UPDATE sessions SET state = 'interrupted' WHERE session_id IN ({placeholders}) AND state IN ('active', 'resumed');",
+                            further_silent_sids,
+                        )
+
                     # Update resumed sessions: sessions with last_heartbeat_at > window_end
                     if window_end:
                         cursor.execute(
@@ -384,10 +406,9 @@ class DetectionEngine:
                             """,
                             (cid, window_end),
                         )
-                        # Count resumed sessions
                         cursor.execute(
-                            "SELECT COUNT(*) AS c FROM sessions WHERE centre_id = ? AND last_heartbeat_at > ?;",
-                            (cid, window_end),
+                            "SELECT COUNT(*) AS c FROM sessions WHERE centre_id = ? AND state = 'resumed';",
+                            (cid,),
                         )
                         evidence["resumed_sessions"] = cursor.fetchone()["c"]
 
@@ -556,10 +577,17 @@ class DetectionEngine:
                                 )
 
                         if status == "recovering":
-                            # Count resumed sessions with last_heartbeat_at > window_end
                             cursor.execute(
-                                "SELECT COUNT(*) AS c FROM sessions WHERE centre_id = ? AND last_heartbeat_at > ?;",
+                                """
+                                UPDATE sessions
+                                SET state = 'resumed'
+                                WHERE centre_id = ? AND state = 'interrupted' AND last_heartbeat_at > ?;
+                                """,
                                 (cid, window_end),
+                            )
+                            cursor.execute(
+                                "SELECT COUNT(*) AS c FROM sessions WHERE centre_id = ? AND state = 'resumed';",
+                                (cid,),
                             )
                             resumed_c = cursor.fetchone()["c"]
                             resume_ratio = (resumed_c / D) if D > 0 else 1.0
@@ -661,8 +689,16 @@ class DetectionEngine:
 
                             if status == "recovering":
                                 cursor.execute(
-                                    "SELECT COUNT(*) AS c FROM sessions WHERE centre_id = ? AND last_heartbeat_at > ?;",
+                                    """
+                                    UPDATE sessions
+                                    SET state = 'resumed'
+                                    WHERE centre_id = ? AND state = 'interrupted' AND last_heartbeat_at > ?;
+                                    """,
                                     (cid, window_end),
+                                )
+                                cursor.execute(
+                                    "SELECT COUNT(*) AS c FROM sessions WHERE centre_id = ? AND state = 'resumed';",
+                                    (cid,),
                                 )
                                 resumed_c = cursor.fetchone()["c"]
                                 resume_ratio = (resumed_c / D) if D > 0 else 1.0
@@ -808,6 +844,47 @@ class DetectionEngine:
                                 self.last_late_update_time[inc_id] = now_mono
 
                     tick_summary["incidents_updated"].append(inc_id)
+
+                # 5. Post-resolution Impact Computation & Restart Safety
+                cursor.execute(
+                    """
+                    SELECT incident_id
+                    FROM incidents
+                    WHERE status = 'resolved' AND impact_computed_at IS NULL;
+                    """
+                )
+                uncomputed_resolved = [r["incident_id"] for r in cursor.fetchall()]
+                for r_id in uncomputed_resolved:
+                    compute_incident_impact(conn, r_id, now_iso, cfg)
+
+                # 6. Stragglers: recompute missing rows when session resumes within recompute_window_s
+                recompute_win_s = getattr(getattr(cfg, "impact", None), "recompute_window_s", 600)
+                cursor.execute(
+                    """
+                    SELECT incident_id, window_end, resolved_at
+                    FROM incidents
+                    WHERE status = 'resolved' AND impact_computed_at IS NOT NULL;
+                    """
+                )
+                resolved_active = cursor.fetchall()
+                for rinc in resolved_active:
+                    res_at_dt = parse_utc_iso(rinc["resolved_at"]) if rinc["resolved_at"] else None
+                    if not res_at_dt or (now - res_at_dt).total_seconds() > recompute_win_s:
+                        continue
+                    inc_id = rinc["incident_id"]
+                    we = rinc["window_end"]
+                    cursor.execute(
+                        """
+                        SELECT s.last_heartbeat_at
+                        FROM incident_impacts ii
+                        JOIN sessions s ON ii.candidate_id = s.candidate_id
+                        WHERE ii.incident_id = ? AND ii.evidence_quality = 'missing';
+                        """,
+                        (inc_id,),
+                    )
+                    missing_rows = cursor.fetchall()
+                    if missing_rows and any(mr["last_heartbeat_at"] and (we is None or mr["last_heartbeat_at"] > we) for mr in missing_rows):
+                        compute_incident_impact(conn, inc_id, now_iso, cfg)
 
                 cursor.close()
 

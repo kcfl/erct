@@ -95,6 +95,22 @@ class IntegrityConfig(BaseModel):
     seq_gap_threshold: int = 10
 
 
+class ImpactConfig(BaseModel):
+    heartbeat_interval_s: float = 2.0
+    loss_gap_factor: float = 5.0
+    stale_hb_factor: float = 2.5
+    baseline_slots: int = 10
+    baseline_missing_max: float = 0.2
+    recompute_window_s: float = 600.0
+
+
+class RemedyConfig(BaseModel):
+    resume_max_lost_s: float = 300.0
+    resume_max_lost_answers: int = 2
+    extra_time_buffer_s: float = 120.0
+    retest_min_affected_fraction: float = 0.5
+
+
 class RemedyRuleConfig(BaseModel):
     id: str
     desc: str
@@ -129,6 +145,8 @@ class AppConfig(BaseModel):
     readiness: ReadinessConfig = Field(default_factory=ReadinessConfig)
     detection: DetectionConfig = Field(default_factory=DetectionConfig)
     integrity: IntegrityConfig = Field(default_factory=IntegrityConfig)
+    impact: ImpactConfig = Field(default_factory=ImpactConfig)
+    remedy: RemedyConfig = Field(default_factory=RemedyConfig)
     remedy_rules: List[RemedyRuleConfig] = Field(default_factory=list)
     remedy_fairness: RemedyFairnessConfig = Field(default_factory=RemedyFairnessConfig)
     comms: CommsConfig = Field(default_factory=CommsConfig)

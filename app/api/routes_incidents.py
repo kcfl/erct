@@ -41,8 +41,9 @@ def _format_incident(row: Any, timeline_rows: List[Any]) -> Dict[str, Any]:
             "detail": detail_parsed,
         })
 
+    impact_summary = evidence_parsed.get("impact_summary")
+
     return {
-        "id": row["incident_id"],
         "incident_id": row["incident_id"],
         "exam_id": row["exam_id"],
         "centre_id": row["centre_id"],
@@ -55,6 +56,8 @@ def _format_incident(row: Any, timeline_rows: List[Any]) -> Dict[str, Any]:
         "resolved_at": row["resolved_at"],
         "detection_rule": row["detection_rule"],
         "evidence": evidence_parsed,
+        "impact_summary": impact_summary,
+        "impact_computed_at": row["impact_computed_at"] if "impact_computed_at" in row.keys() else None,
         "timeline": timeline,
     }
 
@@ -117,3 +120,123 @@ def get_incident(incident_id: str) -> Dict[str, Any]:
         cursor.close()
 
     return _format_incident(row, tl_rows)
+
+
+@router.get("/{incident_id}/impact")
+def get_incident_impact(
+    incident_id: str,
+    remedy: Optional[str] = None,
+    quality: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Retrieve computed impact analysis and remedy recommendations for an incident."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM incidents WHERE incident_id = ?;", (incident_id,))
+        inc = cursor.fetchone()
+        if not inc:
+            cursor.close()
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Incident '{incident_id}' not found.",
+            )
+
+        # While incident is not resolved, return empty rows list with computed_at null
+        if inc["status"] != "resolved":
+            cursor.close()
+            return {
+                "incident_id": incident_id,
+                "computed_at": None,
+                "summary": None,
+                "rows": [],
+            }
+
+        evidence_parsed = {}
+        if inc["evidence"]:
+            try:
+                evidence_parsed = json.loads(inc["evidence"])
+            except Exception:
+                evidence_parsed = {}
+        summary = evidence_parsed.get("impact_summary")
+
+        query = "SELECT * FROM incident_impacts WHERE incident_id = ?"
+        params: List[Any] = [incident_id]
+        if remedy:
+            query += " AND remedy_recommended = ?"
+            params.append(remedy)
+        if quality:
+            query += " AND evidence_quality = ?"
+            params.append(quality)
+        query += " ORDER BY candidate_id ASC;"
+
+        cursor.execute(query, params)
+        raw_rows = cursor.fetchall()
+        cursor.close()
+
+        formatted_rows = []
+        for r in raw_rows:
+            ev_dict = {}
+            if r["evidence"]:
+                try:
+                    ev_dict = json.loads(r["evidence"])
+                except Exception:
+                    ev_dict = {}
+            formatted_rows.append({
+                "incident_id": r["incident_id"],
+                "candidate_id": r["candidate_id"],
+                "session_id": r["session_id"],
+                "lost_seconds": r["lost_seconds"],
+                "unsaved_answers": r["unsaved_answers"],
+                "last_good_seq": r["last_good_seq"],
+                "evidence_quality": r["evidence_quality"],
+                "remedy_recommended": r["remedy_recommended"],
+                "extra_seconds": r["extra_seconds"],
+                "rationale": r["rationale"],
+                "rule_id": r["rule_id"],
+                "evidence": ev_dict,
+                "computed_at": r["computed_at"],
+                "impact_version": r["impact_version"],
+            })
+
+    return {
+        "incident_id": incident_id,
+        "computed_at": inc["impact_computed_at"],
+        "summary": summary,
+        "rows": formatted_rows,
+    }
+
+
+review_router = APIRouter(prefix="/v1/review-queue", tags=["Review Queue"])
+
+
+@review_router.get("")
+def list_review_queue(status: Optional[str] = "pending") -> List[Dict[str, Any]]:
+    """Retrieve review queue rows filtered by status (default 'pending')."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        query = "SELECT * FROM review_queue WHERE 1=1"
+        params: List[Any] = []
+        if status and status.lower() != "all":
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY created_at DESC, review_id DESC;"
+
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        cursor.close()
+
+        results = []
+        for r in rows:
+            results.append({
+                "review_id": r["review_id"],
+                "incident_id": r["incident_id"],
+                "candidate_id": r["candidate_id"],
+                "session_id": r["session_id"],
+                "reason": r["reason"],
+                "status": r["status"],
+                "assignee": r["assignee"],
+                "created_at": r["created_at"],
+                "updated_at": r["updated_at"],
+            })
+
+    return results
+

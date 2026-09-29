@@ -1,15 +1,15 @@
-"""Live fault demonstration script for ERCT.
+"""Live fault demonstration script for ERCT (Phase 3b-i).
 
-Accepts CLI arguments: --type, --centre, --duration, --interval, --port, --kill-api-at.
-Uses isolated temp database and buffer.
-Handles clean shutdown on normal termination or Ctrl+C, and prints whether port is free.
-Queries the Incident API, prints incident row, timeline, evidence, session states, audit verify result,
-and count of 'incident' audit entries.
+Supports repeatable --fault type:centre:duration[:start_offset_s] flags.
+Executes real faults, monitors centre and session states mid-outage and post-outage,
+validates impact computation, calibration against ground truth, audit trail integrity,
+and review queue consistency.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import signal
 import socket
@@ -18,18 +18,20 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
 import httpx
 import yaml
 
 # Ensure project root is on sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from app.core.audit_chain import verify_audit_chain
 from app.db import get_db_connection, init_db
 from app.main import seed_database
-from app.core.audit_chain import verify_audit_chain
 from simulator.agent_runner import SimulatorRunner
 
 
@@ -89,20 +91,39 @@ def launch_api_server(cfg_file: Path, port: int) -> subprocess.Popen:
     return proc
 
 
-def run_live_fault(
-    fault_type: str = "power_loss",
-    centre_id: str = "C-BPL-02",
-    duration_s: float = 60.0,
+@dataclass
+class FaultSpec:
+    fault_type: str
+    centre_id: str
+    duration_s: float
+    start_offset_s: float = 22.0
+    injected: bool = False
+    mid_printed: bool = False
+    post_printed: bool = False
+    mid_status: str = ""
+    mid_states: Dict[str, int] = None
+    post_status: str = ""
+    post_states: Dict[str, int] = None
+
+
+def run_live_demo(
+    faults: List[FaultSpec],
     interval_s: float = 2.0,
     port: int = 8000,
-    kill_api_at: Optional[float] = None,
+    no_fault_duration: float = 60.0,
 ) -> None:
     print("=" * 78)
-    print(f"ERCT LIVE FAULT DEMO: {fault_type.upper()} on {centre_id}")
-    print(f"Configuration: duration={duration_s}s, interval={interval_s}s, kill_api_at={kill_api_at}")
+    print("ERCT LIVE DEMONSTRATION RUNNER (Phase 3b-i)")
+    if faults:
+        print("Scheduled Faults:")
+        for f in faults:
+            print(f"  - {f.fault_type} on {f.centre_id} for {f.duration_s}s (start offset: {f.start_offset_s}s)")
+    else:
+        print(f"No faults configured. Clean run for {no_fault_duration}s.")
+    print(f"Heartbeat interval: {interval_s}s | API Port: {port}")
     print("=" * 78)
 
-    # 1. Setup isolated temporary directory for DB, config, and buffer
+    # 1. Setup isolated temporary directory
     temp_dir = tempfile.TemporaryDirectory(prefix="erct_demo_")
     temp_path = Path(temp_dir.name)
     db_file = temp_path / "demo_erct.db"
@@ -110,11 +131,13 @@ def run_live_fault(
     cfg_file = temp_path / "demo_config.yaml"
     gt_file = temp_path / "ground_truth.jsonl"
 
-    # Clone base config with isolated paths
     with open("config.yaml", "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     cfg["database"]["path"] = str(db_file)
     cfg["simulation"]["ground_truth_path"] = str(gt_file)
+    cfg["impact"]["heartbeat_interval_s"] = interval_s
+    cfg["simulation"]["faults"] = []
+
     with open(cfg_file, "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f)
 
@@ -132,9 +155,8 @@ def run_live_fault(
             api_proc.terminate()
             try:
                 api_proc.wait(timeout=3.0)
-            except subprocess.TimeoutExpired:
+            except Exception:
                 api_proc.kill()
-                api_proc.wait(timeout=2.0)
             api_proc = None
 
         time.sleep(0.5)
@@ -145,7 +167,6 @@ def run_live_fault(
         except Exception:
             pass
 
-    # Register signal handler for clean Ctrl+C
     def sig_handler(sig, frame):
         print("\n[DEMO] Interrupted by user (Ctrl+C). Cleaning up...")
         cleanup()
@@ -154,13 +175,20 @@ def run_live_fault(
     signal.signal(signal.SIGINT, sig_handler)
 
     try:
-        # 2. Launch API process with isolated environment
+        # 2. Launch API
         print(f"[DEMO] Launching API server on {api_url}...")
         api_proc = launch_api_server(cfg_file, port)
-        print(f"[DEMO] API server is ready at {api_url}.")
+        print(f"[DEMO] API server ready.")
 
-        # 3. Start Simulator runner
-        print(f"[DEMO] Starting simulator (interval: {interval_s}s)...")
+        # 3. Determine run duration
+        if faults:
+            max_fault_end = max(f.start_offset_s + f.duration_s for f in faults)
+            buffer_s = 32.0 if any(f.fault_type == "power_loss" for f in faults) else 18.0
+            total_run_s = max_fault_end + buffer_s
+        else:
+            total_run_s = no_fault_duration
+
+        print(f"[DEMO] Starting simulator for {total_run_s:.1f}s total...")
         runner = SimulatorRunner(
             api_base_url=api_url,
             buffer_db_path=str(buf_file),
@@ -168,18 +196,7 @@ def run_live_fault(
             ground_truth_path=str(gt_file),
         )
 
-        # Calculate run timing
-        if fault_type == "none":
-            pre_fault_s = 0.0
-            post_window_s = 0.0
-            total_run_s = duration_s
-        else:
-            pre_fault_s = 5.0
-            post_window_s = 25.0 if fault_type == "power_loss" else 20.0
-            total_run_s = pre_fault_s + duration_s + post_window_s
-
         import threading
-
         runner_thread = threading.Thread(
             target=runner.start,
             kwargs={"duration_s": total_run_s},
@@ -187,258 +204,272 @@ def run_live_fault(
         )
         runner_thread.start()
 
-        pre_kill_id: Optional[str] = None
-        post_restart_id: Optional[str] = None
-        api_killed_flag = False
-
-        if fault_type != "none":
-            # Wait pre-fault period to establish steady state
-            print(f"[DEMO] Waiting {pre_fault_s}s for initial steady-state telemetry...")
-            time.sleep(pre_fault_s)
-
-            # 4. Inject fault via POST /v1/control/faults
-            params = {"source": "grid", "backup_minutes": 15} if fault_type == "power_loss" else {"uplink": "primary_fiber"}
-            print(f"\n[DEMO] >>> POSTing {fault_type} for {centre_id} (duration: {duration_s}s)...")
-            resp = httpx.post(
-                f"{api_url}/v1/control/faults",
-                headers={"X-Control-Key": "ctrl-secret-key-2026"},
-                json={
-                    "centre_id": centre_id,
-                    "fault_type": fault_type,
-                    "duration_s": int(duration_s),
-                    "params": params,
-                },
-                timeout=5.0,
-            )
-            print(f"[DEMO] Control API responded: {resp.status_code} | {resp.text}")
-            assert resp.status_code == 201
-
-        # 5. Monitor run and handle --kill-api-at if configured
-        print(f"[DEMO] Simulation running for {total_run_s:.1f}s total. Monitoring...")
         start_mono = time.monotonic()
+
+        # 4. Monitoring loop: inject faults, print mid-outage and post-outage
         while runner_thread.is_alive():
             elapsed = time.monotonic() - start_mono
-            if kill_api_at is not None and not api_killed_flag and elapsed >= kill_api_at:
-                api_killed_flag = True
-                print(f"\n[DEMO] >>> t={elapsed:.1f}s: Reached --kill-api-at ({kill_api_at}s). Querying API before kill...")
-                try:
-                    r = httpx.get(f"{api_url}/v1/incidents", timeout=2.0)
-                    if r.status_code == 200:
-                        incs = r.json()
-                        if incs:
-                            pre_kill_id = incs[0].get("id") or incs[0].get("incident_id")
-                            print(f"[DEMO] Pre-kill incident captured: {pre_kill_id} (status: {incs[0]['status']})")
-                except Exception as e:
-                    print(f"[DEMO] Warning reading pre-kill incident: {e}")
 
-                print(f"[DEMO] >>> Killing API process (pid={api_proc.pid})...")
-                api_proc.terminate()
-                try:
-                    api_proc.wait(timeout=3.0)
-                except subprocess.TimeoutExpired:
-                    api_proc.kill()
-                    api_proc.wait(timeout=2.0)
-                api_proc = None
+            # Check injection
+            for f in faults:
+                if not f.injected and elapsed >= f.start_offset_s:
+                    f.injected = True
+                    params = {"source": "grid", "backup_minutes": 15} if f.fault_type == "power_loss" else {"uplink": "primary_fiber"}
+                    print(f"\n[DEMO +{elapsed:.1f}s] >>> Injecting {f.fault_type} on {f.centre_id} for {f.duration_s}s...")
+                    try:
+                        resp = httpx.post(
+                            f"{api_url}/v1/control/faults",
+                            headers={"X-Control-Key": "ctrl-secret-key-2026"},
+                            json={
+                                "centre_id": f.centre_id,
+                                "fault_type": f.fault_type,
+                                "duration_s": int(f.duration_s),
+                                "params": params,
+                            },
+                            timeout=5.0,
+                        )
+                        print(f"[DEMO] Fault command registered: status {resp.status_code}")
+                    except Exception as e:
+                        print(f"[DEMO ERROR] Failed registering fault: {e}")
 
-                print("[DEMO] API server killed. Sleeping 2 seconds to simulate downtime...")
-                time.sleep(2.0)
+                # Mid-outage check (at start + duration / 2)
+                mid_time = f.start_offset_s + (f.duration_s / 2.0)
+                if f.injected and not f.mid_printed and elapsed >= mid_time:
+                    f.mid_printed = True
+                    try:
+                        r_c = httpx.get(f"{api_url}/v1/centres", timeout=2.0)
+                        centres_data = r_c.json() if r_c.status_code == 200 else []
+                        c_match = next((c for c in centres_data if c["centre_id"] == f.centre_id), None)
+                        c_status = c_match.get("status") if c_match else "unknown"
+                    except Exception:
+                        c_status = "error"
 
-                print(f"[DEMO] >>> Restarting API server on {api_url} with same DB...")
-                api_proc = launch_api_server(cfg_file, port)
-                print(f"[DEMO] API server successfully restarted (pid={api_proc.pid}).")
+                    with get_db_connection(str(db_file)) as conn:
+                        rows = conn.execute(
+                            "SELECT state, COUNT(*) as c FROM sessions WHERE centre_id = ? GROUP BY state;",
+                            (f.centre_id,),
+                        ).fetchall()
+                        st_dict = {r["state"]: r["c"] for r in rows}
 
-                # Immediately query incidents after restart
-                try:
-                    r = httpx.get(f"{api_url}/v1/incidents", timeout=2.0)
-                    if r.status_code == 200:
-                        incs = r.json()
-                        if incs:
-                            post_restart_id = incs[0].get("id") or incs[0].get("incident_id")
-                            print(f"[DEMO] Post-restart incident captured: {post_restart_id} (status: {incs[0]['status']})")
-                except Exception as e:
-                    print(f"[DEMO] Warning reading post-restart incident: {e}")
+                    f.mid_status = c_status
+                    f.mid_states = st_dict
+                    print(f"\n[MID-OUTAGE {f.centre_id} @ +{elapsed:.1f}s]")
+                    print(f"  Centre Status: {c_status} (expected: down)")
+                    print(f"  Session State Breakdown: {st_dict} (expect interrupted)")
+
+                # Post-outage check (at start + duration + post_offset)
+                post_offset = 15.0 if f.fault_type == "power_loss" else 5.0
+                post_time = f.start_offset_s + f.duration_s + post_offset
+                if f.injected and not f.post_printed and elapsed >= post_time:
+                    f.post_printed = True
+                    try:
+                        r_c = httpx.get(f"{api_url}/v1/centres", timeout=2.0)
+                        centres_data = r_c.json() if r_c.status_code == 200 else []
+                        c_match = next((c for c in centres_data if c["centre_id"] == f.centre_id), None)
+                        c_status = c_match.get("status") if c_match else "unknown"
+                    except Exception:
+                        c_status = "error"
+
+                    with get_db_connection(str(db_file)) as conn:
+                        rows = conn.execute(
+                            "SELECT state, COUNT(*) as c FROM sessions WHERE centre_id = ? GROUP BY state;",
+                            (f.centre_id,),
+                        ).fetchall()
+                        st_dict = {r["state"]: r["c"] for r in rows}
+
+                    f.post_status = c_status
+                    f.post_states = st_dict
+                    print(f"\n[POST-OUTAGE {f.centre_id} @ +{elapsed:.1f}s]")
+                    print(f"  Centre Status: {c_status} (recovering/ready)")
+                    print(f"  Session State Breakdown: {st_dict}")
 
             time.sleep(0.5)
 
         runner_thread.join(timeout=30.0)
 
-        # Allow final buffer drain and final ticks
-        print("\n[DEMO] Simulation loop finished. Performing final buffer drain...")
+        # Allow final buffer drain and settle
+        print("\n[DEMO] Simulation loop complete. Draining remaining events...")
         runner.buffer.drain_all(api_base_url=api_url)
-        time.sleep(1.0)  # Wait for DetectionWorker tick to settle
+        time.sleep(1.5)
 
-        # 6. Comprehensive Reporting
+        # Poll until all expected incidents have impact_computed_at
+        expected_inc_count = len(faults)
+        incidents_list: List[Dict[str, Any]] = []
+        for _ in range(30):
+            try:
+                r_inc = httpx.get(f"{api_url}/v1/incidents", timeout=2.0)
+                if r_inc.status_code == 200:
+                    incidents_list = r_inc.json()
+                    all_resolved_and_computed = (
+                        len(incidents_list) >= expected_inc_count
+                        and all(i.get("status") == "resolved" and i.get("impact_computed_at") for i in incidents_list)
+                    )
+                    if all_resolved_and_computed or expected_inc_count == 0:
+                        break
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+        # =======================================================================
+        # VERIFICATION AND REPORTING
+        # =======================================================================
         print("\n" + "=" * 78)
-        print("ERCT PHASE 3a-ii INCIDENT & VERIFICATION REPORT")
+        print("ERCT LIVE RUN REPORT & VERIFICATION")
         print("=" * 78)
 
-        # Health & Telemetry
-        try:
-            r_health = httpx.get(f"{api_url}/v1/health", timeout=3.0)
-            health_data = r_health.json() if r_health.status_code == 200 else {}
-        except Exception as e:
-            health_data = {"error": str(e)}
+        # (1) Status and state counts mid-outage and after end
+        if faults:
+            print("\n(1) OUTAGE TELEMETRY & SESSION STATES (MID-OUTAGE & POST-OUTAGE)")
+            for f in faults:
+                print(f"  Centre {f.centre_id}:")
+                print(f"    Mid-outage status : {f.mid_status} | Session states: {f.mid_states}")
+                print(f"    Post-outage status: {f.post_status} | Session states: {f.post_states}")
 
-        print("\n--- 1. SYSTEM HEALTH & DETECTION TELEMETRY ---")
-        print(f"Health Status: {health_data.get('status')}")
-        det_info = health_data.get("detection", {})
-        print(f"Detection Telemetry: {json.dumps(det_info, indent=2)}")
+        # (2) & (3) & (4) & (5) Incidents and Impacts
+        print(f"\n(2) INCIDENTS & IMPACT SUMMARIES (Total Incidents: {len(incidents_list)})")
+        if not incidents_list and not faults:
+            print("  Zero incidents recorded as expected for clean run.")
 
-        # Incidents List & Details
-        try:
-            r_inc = httpx.get(f"{api_url}/v1/incidents", timeout=3.0)
-            incidents_list = r_inc.json() if r_inc.status_code == 200 else []
-        except Exception as e:
-            incidents_list = []
-            print(f"Error fetching incidents: {e}")
+        centre_avg_extra: Dict[str, float] = {}
 
-        print(f"\n--- 2. INCIDENTS SUMMARY (Total Incidents: {len(incidents_list)}) ---")
         for inc in incidents_list:
-            inc_id = inc.get("id") or inc.get("incident_id")
-            print(f"\nIncident Row: {inc_id}")
-            print(f"  Exam ID       : {inc.get('exam_id')}")
-            print(f"  Centre ID     : {inc.get('centre_id')}")
-            print(f"  Type          : {inc.get('type')}")
-            print(f"  Severity      : {inc.get('severity')}")
-            print(f"  Status        : {inc.get('status')}")
-            print(f"  Rule          : {inc.get('detection_rule')}")
-            print(f"  Detected At   : {inc.get('detected_at')}")
-            print(f"  Window Start  : {inc.get('window_start')}")
-            print(f"  Window End    : {inc.get('window_end')}")
-            print(f"  Resolved At   : {inc.get('resolved_at')}")
+            inc_id = inc["incident_id"]
+            cid = inc["centre_id"]
+            print(f"\n  -------------------------------------------------------------------")
+            print(f"  Incident ID   : {inc_id} ({inc['type']} on {cid})")
+            print(f"  Status        : {inc['status']}")
+            print(f"  Window        : {inc['window_start']} -> {inc['window_end']}")
+            print(f"  Resolved At   : {inc['resolved_at']}")
+            print(f"  Computed At   : {inc.get('impact_computed_at')}")
 
-            try:
-                r_det = httpx.get(f"{api_url}/v1/incidents/{inc_id}", timeout=3.0)
-                det_data = r_det.json() if r_det.status_code == 200 else inc
-            except Exception:
-                det_data = inc
+            # (5) Computed_at vs resolved_at
+            if inc.get("impact_computed_at") and inc.get("resolved_at"):
+                t_comp = parse_iso(inc["impact_computed_at"])
+                t_res = parse_iso(inc["resolved_at"])
+                delta_s = (t_comp - t_res).total_seconds()
+                print(f"  Latency (computed_at - resolved_at): {delta_s:.2f} s (computed_at >= resolved_at: {delta_s >= 0})")
 
-            print("\n  Incident Timeline:")
-            timeline = det_data.get("timeline", [])
-            if timeline:
-                for t in timeline:
-                    print(f"    [{t.get('ts')}] kind={t.get('kind')} | detail={t.get('detail')}")
-            else:
-                print("    (No timeline entries)")
+            # Fetch impact
+            r_imp = httpx.get(f"{api_url}/v1/incidents/{inc_id}/impact", timeout=3.0)
+            imp_data = r_imp.json() if r_imp.status_code == 200 else {}
+            summary = imp_data.get("summary") or {}
+            rows = imp_data.get("rows") or []
 
-            print("\n  Evidence JSON:")
-            ev = det_data.get("evidence", {})
-            print(json.dumps(ev, indent=4))
+            print(f"\n  Impact Summary:")
+            print(f"    Exposed Sessions         : {summary.get('exposed')}")
+            print(f"    By Remedy                : {summary.get('by_remedy')}")
+            print(f"    By Rule                  : {summary.get('by_rule')}")
+            print(f"    By Quality               : {summary.get('by_quality')}")
+            print(f"    Avg Extra Seconds        : {summary.get('avg_extra_seconds')} s")
+            print(f"    Max Extra Seconds        : {summary.get('max_extra_seconds')} s")
+            print(f"    Centre Affected Fraction : {summary.get('centre_affected_fraction')}")
+            print(f"    Centre Retest Recommended: {summary.get('centre_retest_recommended')}")
 
-        # DB Session States & Audit Checks
+            centre_avg_extra[cid] = summary.get("avg_extra_seconds", 0.0)
+
+            # (3) Calibration and Oracle numbers against ground truth if present
+            if gt_file.exists():
+                with open(gt_file, "r", encoding="utf-8") as f_gt:
+                    gt_records = [json.loads(line) for line in f_gt if line.strip()]
+                def types_match(t1: str, t2: str) -> bool:
+                    return t1 == t2 or (t1 in t2) or (t2 in t1)
+
+                gt_match = next((r for r in gt_records if r["centre_id"] == cid and types_match(r["type"], inc["type"])), None)
+                if gt_match:
+                    gt_cands = {c["candidate_id"]: c for c in gt_match.get("candidates", [])}
+                    strong_rows = [r for r in rows if r["evidence_quality"] == "strong"]
+                    partial_rows = [r for r in rows if r["evidence_quality"] != "strong"]
+
+                    calib_matches = 0
+                    oracle_matches = 0
+                    for r in strong_rows:
+                        cand_id = r["candidate_id"]
+                        if cand_id in gt_cands:
+                            gt_c = gt_cands[cand_id]
+                            # Calibration check
+                            stale_factor = cfg.get("impact", {}).get("stale_hb_factor", 2.5)
+                            stale_tol = stale_factor * interval_s
+                            diff = abs(r["lost_seconds"] - gt_c.get("lost_s_from_fault_start", 0.0))
+                            ans_diff = (r["unsaved_answers"] == gt_c.get("expected_lost_answers", 0))
+                            if diff <= stale_tol + 0.1 and ans_diff:
+                                calib_matches += 1
+
+                            # Oracle check
+                            o_lost = gt_c.get("lost_s_from_fault_start", 0.0)
+                            o_ans = gt_c.get("expected_lost_answers", 0)
+                            oracle_rem = "resume" if (o_lost <= 300 and o_ans <= 2) else "extra_time"
+                            if r["remedy_recommended"] == oracle_rem:
+                                oracle_matches += 1
+
+                    print(f"\n  (3) Calibration & Oracle Results (against ground truth):")
+                    print(f"    Total Evaluated Candidates  : {len(rows)}")
+                    print(f"    Strong Quality Candidates   : {len(strong_rows)}")
+                    print(f"    Partial / Non-Strong        : {len(partial_rows)}")
+                    if strong_rows:
+                        print(f"    Calibration Accuracy (b)   : {calib_matches}/{len(strong_rows)} ({calib_matches / len(strong_rows):.1%})")
+                        print(f"    Oracle Match Rate (c)       : {oracle_matches}/{len(strong_rows)} ({oracle_matches / len(strong_rows):.1%})")
+
+            # (4) Example Rows with Rationale (one R1, one R2, one manual_review)
+            print(f"\n  (4) Representative Rows & Plain-Language Rationales:")
+            r1_sample = next((r for r in rows if r["rule_id"] == "R1"), None)
+            r2_sample = next((r for r in rows if r["rule_id"] == "R2"), None)
+            r3_sample = next((r for r in rows if r["rule_id"] == "R3" or r["remedy_recommended"] == "manual_review"), None)
+
+            if r1_sample:
+                print(f"    [Sample R1 Row - {r1_sample['candidate_id']}]:")
+                print(f"      Remedy: {r1_sample['remedy_recommended']} | Extra Time: {r1_sample['extra_seconds']}s | Lost: {r1_sample['lost_seconds']}s | Unsaved: {r1_sample['unsaved_answers']}")
+                print(f"      Rationale: \"{r1_sample['rationale']}\"")
+            if r2_sample:
+                print(f"    [Sample R2 Row - {r2_sample['candidate_id']}]:")
+                print(f"      Remedy: {r2_sample['remedy_recommended']} | Extra Time: {r2_sample['extra_seconds']}s | Lost: {r2_sample['lost_seconds']}s | Unsaved: {r2_sample['unsaved_answers']}")
+                print(f"      Rationale: \"{r2_sample['rationale']}\"")
+            if r3_sample:
+                print(f"    [Sample Manual Review Row - {r3_sample['candidate_id']}]:")
+                print(f"      Remedy: {r3_sample['remedy_recommended']} | Quality: {r3_sample['evidence_quality']}")
+                print(f"      Rationale: \"{r3_sample['rationale']}\"")
+
+        # Multi-fault average extra seconds per centre
+        if len(centre_avg_extra) > 1:
+            print("\n  Average Extra Seconds Per Centre (Fairness Benchmark):")
+            for cid, avg_s in centre_avg_extra.items():
+                print(f"    {cid}: {avg_s:.1f} s")
+
+        # (6) Audit Verification & Entry Counts
         with get_db_connection(str(db_file)) as conn:
             cursor = conn.cursor()
-
-            print("\n--- 3. SESSION STATE BREAKDOWN ---")
-            if fault_type != "none":
-                cursor.execute(
-                    "SELECT state, COUNT(*) as count FROM sessions WHERE centre_id = ? GROUP BY state ORDER BY state;",
-                    (centre_id,),
-                )
-                rows = cursor.fetchall()
-                print(f"  Centre {centre_id} session states:")
-                for r in rows:
-                    print(f"    {r['state']}: {r['count']}")
-
-            cursor.execute(
-                "SELECT centre_id, state, COUNT(*) as count FROM sessions GROUP BY centre_id, state ORDER BY centre_id, state;"
-            )
-            rows_all = cursor.fetchall()
-            print("  All centres session state breakdown:")
-            for r in rows_all:
-                print(f"    {r['centre_id']} -> {r['state']}: {r['count']}")
-
-            print("\n--- 4. AUDIT CHAIN INTEGRITY & 'incident' ENTRIES ---")
             audit_res = verify_audit_chain(str(db_file))
-            print(f"  Audit Verify Result: ok={audit_res.ok}, total_entries={audit_res.total_entries}, error={audit_res.error}")
+            cursor.execute("SELECT COUNT(*) AS c FROM audit_log WHERE entry_type = 'impact';")
+            impact_audit_c = cursor.fetchone()["c"]
+            cursor.execute("SELECT COUNT(*) AS c FROM audit_log WHERE entry_type = 'incident';")
+            inc_audit_c = cursor.fetchone()["c"]
+            cursor.execute("SELECT COUNT(*) AS c FROM incident_impacts;")
+            total_impact_rows = cursor.fetchone()["c"]
 
-            cursor.execute(
-                "SELECT seq, ts, entry_type, ref_id, payload FROM audit_log WHERE entry_type = 'incident' ORDER BY seq ASC;"
-            )
-            inc_audits = cursor.fetchall()
-            print(f"  Total 'incident' Audit Entries: {len(inc_audits)}")
-            for r in inc_audits:
-                p = json.loads(r["payload"]) if isinstance(r["payload"], str) else r["payload"]
-                print(f"    seq={r['seq']} ts={r['ts']} action={p.get('action')} incident_id={p.get('incident_id')}")
+            print(f"\n(6) AUDIT HASH CHAIN VERIFICATION")
+            print(f"  Verification Result : ok={audit_res.ok} (Head Hash: {audit_res.head_hash[:16]}...)")
+            print(f"  'impact' Entries   : {impact_audit_c} (Total impact rows: {total_impact_rows})")
+            print(f"  'incident' Entries : {inc_audit_c}")
 
-            print("\n--- 5. SCENARIO-SPECIFIC VERIFICATION ---")
-            if fault_type == "power_loss":
-                cursor.execute("SELECT ts FROM events WHERE centre_id = ? AND type = 'POWER_LOSS' ORDER BY ts ASC LIMIT 1;", (centre_id,))
-                r_pl = cursor.fetchone()
-                pl_ts = r_pl["ts"] if r_pl else "NOT_FOUND"
+            # (7) Review Queue Count vs 'under_review' Sessions
+            cursor.execute("SELECT COUNT(*) AS c FROM review_queue WHERE status = 'pending';")
+            pending_rq_c = cursor.fetchone()["c"]
+            cursor.execute("SELECT COUNT(*) AS c FROM sessions WHERE state = 'under_review';")
+            under_rev_c = cursor.fetchone()["c"]
 
-                cursor.execute(
-                    "SELECT ts FROM events WHERE centre_id = ? AND type = 'HEARTBEAT' AND ts < ? ORDER BY ts DESC LIMIT 1;",
-                    (centre_id, pl_ts),
-                )
-                r_last_hb = cursor.fetchone()
-                last_hb_ts = r_last_hb["ts"] if r_last_hb else "NOT_FOUND"
+            print(f"\n(7) REVIEW QUEUE CONSISTENCY")
+            print(f"  Review Queue Pending Rows : {pending_rq_c}")
+            print(f"  Sessions in 'under_review': {under_rev_c}")
+            print(f"  Counts Equal              : {pending_rq_c == under_rev_c}")
 
-                target_inc = next((i for i in incidents_list if i["centre_id"] == centre_id), None)
-                if target_inc and last_hb_ts != "NOT_FOUND":
-                    t_det = parse_iso(target_inc["detected_at"])
-                    t_hb = parse_iso(last_hb_ts)
-                    latency_s = (t_det - t_hb).total_seconds()
-                    print(f"  Last good heartbeat ts : {last_hb_ts}")
-                    print(f"  POWER_LOSS ts          : {pl_ts}")
-                    print(f"  Incident detected_at   : {target_inc['detected_at']}")
-                    print(f"  Time from last good heartbeat to detected_at: {latency_s:.2f} s")
-
-                if kill_api_at is not None:
-                    print(f"\n  Kill/Restart Verification:")
-                    print(f"    Pre-kill incident ID    : {pre_kill_id}")
-                    print(f"    Post-restart incident ID: {post_restart_id}")
-                    print(f"    Same ID preserved       : {pre_kill_id == post_restart_id}")
-                    c_target = sum(1 for i in incidents_list if i["centre_id"] == centre_id)
-                    c_other = sum(1 for i in incidents_list if i["centre_id"] != centre_id)
-                    print(f"    Total incidents for {centre_id}: {c_target} (expected 1)")
-                    print(f"    Total incidents for other centres: {c_other} (expected 0)")
-
-            elif fault_type == "network_drop":
-                target_inc = next((i for i in incidents_list if i["centre_id"] == centre_id), None)
-                if target_inc:
-                    ev = target_inc.get("evidence", {})
-                    print(f"  Opened Rule/Confidence : {ev.get('reclassified_from', ev.get('confidence'))} (Rule: CENTRE_LOSS_FRACTION)")
-                    print(f"  Final Rule/Confidence  : {ev.get('confidence')} (Rule: {target_inc.get('detection_rule')})")
-                    print(f"  Late events counted    : {ev.get('late_events')}")
-                    print(f"  Incident resolved_at   : {target_inc.get('resolved_at')}")
-                    print(f"  Incident status        : {target_inc.get('status')}")
-
-            elif fault_type == "none":
-                print(f"  Total incidents count  : {len(incidents_list)} (expected 0)")
-                print(f"  Ticks recorded         : {det_info.get('ticks')} (expected >= 55)")
-                print(f"  Ingest stalled         : {det_info.get('ingest_stalled')} (expected False)")
+            # (8) Backlog & Residual Metric
+            max_res = getattr(runner, "max_residual_after_step0", 0)
+            peak_bl = getattr(runner, "peak_backlog_after_step0", runner.peak_backlog)
+            print(f"\n(8) SIMULATOR RESIDUAL BACKLOG METRIC")
+            print(f"  Max Residual Pending (post-step 0): {max_res} events")
+            print(f"  Peak Queue Backlog   (post-step 0): {peak_bl} events")
 
             cursor.close()
 
-        # Ground Truth Summary from JSONL if present
-        if os.path.exists(gt_file):
-            print("\nGround Truth Summary (data/ground_truth.jsonl):")
-            with open(gt_file, "r", encoding="utf-8") as f:
-                records = [json.loads(line) for line in f if line.strip()]
-            for rec in records:
-                cands = rec.get("candidates", [])
-                aff_count = len(cands)
-                unsaved_gt2 = sum(1 for c in cands if c.get("unsaved_answers_at_start", 0) > 2)
-                le2_nonflaky = sum(1 for c in cands if c.get("unsaved_answers_at_start", 0) <= 2 and not c.get("is_flaky", False))
-                flaky_cnt = sum(1 for c in cands if c.get("is_flaky", False))
-                lost_times = [c.get("lost_s_true", 0.0) for c in cands]
-                lost_min = min(lost_times) if lost_times else 0.0
-                lost_med = statistics.median(lost_times) if lost_times else 0.0
-                lost_max = max(lost_times) if lost_times else 0.0
-
-                all_zero = all(t == 0.0 for t in lost_times)
-                print(f"  Fault: {rec['type']} on {rec['centre_id']} (duration: {rec['actual_duration_s']:.2f}s)")
-                print(f"  Affected candidates        : {aff_count}")
-                print(f"  Candidates with unsaved > 2 : {unsaved_gt2}")
-                print(f"  Candidates with <= 2 nonflaky: {le2_nonflaky}")
-                print(f"  Flaky candidates           : {flaky_cnt}")
-                if rec['type'] == 'network_drop':
-                    print(f"  True lost seconds (s)      : lost_s_true = 0 for all candidates ({all_zero}) (buffered & delivered)")
-                else:
-                    print(f"  True lost seconds (s)      : min={lost_min:.2f}s, med={lost_med:.2f}s, max={lost_max:.2f}s")
-
-        print(f"\nPeak buffer backlog after step 0: {getattr(runner, 'peak_backlog_after_step0', runner.peak_backlog)} events")
         print("=" * 78)
 
     finally:
@@ -447,21 +478,46 @@ def run_live_fault(
 
 def main():
     parser = argparse.ArgumentParser(description="ERCT Live Fault Demonstration Runner")
-    parser.add_argument("--type", choices=["power_loss", "network_drop", "none"], default="power_loss")
+    parser.add_argument(
+        "--fault",
+        action="append",
+        dest="faults",
+        help="Repeatable fault specification: type:centre:duration[:start_offset_s]",
+    )
+    # Old shortcut flags
+    parser.add_argument("--power-loss", action="store_true", help="Shortcut for --fault power_loss:C-BPL-02:60")
+    parser.add_argument("--network-drop", action="store_true", help="Shortcut for --fault network_drop:C-BPL-04:30")
+    parser.add_argument("--type", choices=["power_loss", "network_drop", "none"], default=None)
     parser.add_argument("--centre", default="C-BPL-02")
     parser.add_argument("--duration", type=float, default=60.0)
     parser.add_argument("--interval", type=float, default=2.0)
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--kill-api-at", type=float, default=None, help="Seconds into run when API is terminated and restarted")
+
     args = parser.parse_args()
 
-    run_live_fault(
-        fault_type=args.type,
-        centre_id=args.centre,
-        duration_s=args.duration,
+    fault_specs: List[FaultSpec] = []
+    if args.faults:
+        for f_str in args.faults:
+            parts = f_str.split(":")
+            f_type = parts[0]
+            f_centre = parts[1]
+            f_dur = float(parts[2])
+            f_start = float(parts[3]) if len(parts) > 3 else 22.0
+            fault_specs.append(FaultSpec(fault_type=f_type, centre_id=f_centre, duration_s=f_dur, start_offset_s=f_start))
+    elif args.power_loss:
+        fault_specs.append(FaultSpec(fault_type="power_loss", centre_id="C-BPL-02", duration_s=60.0, start_offset_s=22.0))
+    elif args.network_drop:
+        fault_specs.append(FaultSpec(fault_type="network_drop", centre_id="C-BPL-04", duration_s=30.0, start_offset_s=22.0))
+    elif args.type and args.type != "none":
+        fault_specs.append(FaultSpec(fault_type=args.type, centre_id=args.centre, duration_s=args.duration, start_offset_s=22.0))
+
+    no_fault_dur = args.duration if not fault_specs else 60.0
+
+    run_live_demo(
+        faults=fault_specs,
         interval_s=args.interval,
         port=args.port,
-        kill_api_at=args.kill_api_at,
+        no_fault_duration=no_fault_dur,
     )
 
 

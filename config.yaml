@@ -104,25 +104,19 @@ integrity:
   login_fail_burst_threshold: 5     # Bursts of login failures indicating brute force / abuse
   seq_gap_threshold: 10             # Sequence gaps indicating dropped or bypassed telemetry
 
-# Evaluated strictly first-match: R3 -> R4 -> R1 -> R2
-remedy_rules:
-  - id: "R3"
-    desc: "Evidence partial or missing; route to manual review"
-    condition: "quality != 'strong'"
-    action: "manual_review"
-  - id: "R4"
-    desc: "Centre-level integrity failure; recommend centre re-test"
-    condition: "centre_affected_fraction >= 0.5 and integrity_flag"
-    action: "retest_recommended"
-  - id: "R1"
-    desc: "Short interruption with minimal loss; restore remaining time"
-    condition: "lost_s <= 300 and unsaved_answers <= 2"
-    action: "resume"
-  - id: "R2"
-    desc: "Longer interruption or multiple unsaved answers; compensate lost time plus buffer"
-    condition: "lost_s > 300 or unsaved_answers > 2"
-    action: "extra_time"
-    buffer_s: 120
+impact:
+  heartbeat_interval_s: 2.0      # expected cadence, must match the simulator
+  loss_gap_factor: 5             # a gap between consecutive heartbeats longer than factor * interval is real loss, shorter is noise
+  stale_hb_factor: 2.5           # last heartbeat older than factor*interval before window_start => evidence partial
+  baseline_slots: 10             # interval slots before window_start used to judge heartbeat regularity
+  baseline_missing_max: 0.2      # more missing slots than this => evidence partial
+  recompute_window_s: 600        # keep refreshing rows that are still 'missing'
+
+remedy:
+  resume_max_lost_s: 300
+  resume_max_lost_answers: 2
+  extra_time_buffer_s: 120
+  retest_min_affected_fraction: 0.5
 
 remedy_fairness:
   max_extra_time_disparity_s: 300

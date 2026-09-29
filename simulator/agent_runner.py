@@ -457,6 +457,7 @@ class SimulatorRunner:
         self.processed_config_faults: Set[str] = set()
         self.peak_backlog: int = 0
         self.peak_backlog_after_step0: int = 0
+        self.max_residual_after_step0: int = 0
 
         self._init_entities()
         self.http_client = httpx.Client(timeout=2.0)
@@ -647,8 +648,18 @@ class SimulatorRunner:
                     lost_s = round(max(0.0, (t_res - t_last).total_seconds()), 2)
                 else:
                     lost_s = round(af.actual_duration_s + cl.boot_delay_s, 2)
+
+                if cl.resumed_ts and af.start_ts:
+                    t_res = datetime.fromisoformat(cl.resumed_ts.replace("Z", "+00:00"))
+                    t_start = datetime.fromisoformat(af.start_ts.replace("Z", "+00:00"))
+                    lost_from_start = round(max(0.0, (t_res - t_start).total_seconds()), 2)
+                else:
+                    lost_from_start = round(af.actual_duration_s + cl.boot_delay_s, 2)
+                exp_lost_ans = cl.unsaved_answers_at_start
             else:
                 lost_s = 0.0
+                lost_from_start = 0.0
+                exp_lost_ans = 0
 
             cand_list.append({
                 "candidate_id": cl.candidate_id,
@@ -659,6 +670,8 @@ class SimulatorRunner:
                 "unsaved_answers_at_start": cl.unsaved_answers_at_start,
                 "resumed_ts": cl.resumed_ts or af.end_ts,
                 "lost_s_true": lost_s,
+                "lost_s_from_fault_start": lost_from_start,
+                "expected_lost_answers": exp_lost_ans,
             })
 
         record = {
@@ -705,16 +718,16 @@ class SimulatorRunner:
                     )
                 )
 
-        # Candidate Heartbeats and Answers
+        # Candidate Answers and Heartbeats
         for client in self.candidate_clients:
             cid = client.centre_id
-            hb = client.tick_heartbeat(self.heartbeat_interval_s, clock_speed=self.exam_clock_speed)
-            if hb:
-                events_by_centre[cid].append(hb)
-
             ans = client.advance_answer()
             if ans:
                 events_by_centre[cid].append(ans)
+
+            hb = client.tick_heartbeat(self.heartbeat_interval_s, clock_speed=self.exam_clock_speed)
+            if hb:
+                events_by_centre[cid].append(hb)
 
         # Check pending power-loss ground-truth completion
         self._check_ground_truth_completion(force=False)
@@ -751,13 +764,18 @@ class SimulatorRunner:
 
                 self._check_expired_faults()
 
+                # Measure residual pending BEFORE generating new step
+                residual = self.buffer.get_pending_count()
+                if step > 0:
+                    self.max_residual_after_step0 = max(self.max_residual_after_step0, residual)
+
                 queued = self.generate_step(step)
                 pending = self.buffer.get_pending_count()
                 self.peak_backlog = max(self.peak_backlog, pending)
                 if step > 0:
                     self.peak_backlog_after_step0 = max(self.peak_backlog_after_step0, pending)
 
-                print(f"[SIMULATOR] Step {step:02d} (+{sim_elapsed_s:.1f}s): queued {queued} evts | {pending} pending (peak: {self.peak_backlog}, post-step0: {self.peak_backlog_after_step0})")
+                print(f"[SIMULATOR] Step {step:02d} (+{sim_elapsed_s:.1f}s): queued {queued} evts | residual: {residual} (max post-step0: {self.max_residual_after_step0}) | total pending: {pending}")
 
                 step += 1
                 if duration_s and sim_elapsed_s >= duration_s:
@@ -787,7 +805,7 @@ class SimulatorRunner:
 
             final_pending = self.buffer.get_pending_count()
             self.sender.running = False
-            print(f"[SIMULATOR] Done. Dispatched: {self.sender.total_dispatched}, Final pending: {final_pending}, Peak backlog: {self.peak_backlog} (post-step0: {self.peak_backlog_after_step0})")
+            print(f"[SIMULATOR] Done. Dispatched: {self.sender.total_dispatched}, Final pending: {final_pending}, Peak backlog: {self.peak_backlog} (post-step0: {self.peak_backlog_after_step0}), Max residual post-step0: {self.max_residual_after_step0}")
 
 
 def main() -> None:

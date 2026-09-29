@@ -148,3 +148,14 @@ First match wins, strictly evaluated in order **R3 -> R4 -> R1 -> R2**:
 - **Active Incident Singularity:** A unique partial SQLite index `idx_incidents_active_centre` enforces at most one active (`open` or `recovering`) incident per `(exam_id, centre_id)`. New incidents for a centre can only be created after resolution ($n+1$ sequence naming).
 - **Rule A vs Rule B:** Explicit hardware signals (`POWER_LOSS`, `NETWORK_DOWN`) immediately trigger high-confidence incidents independent of startup grace or ingest stalls. Inferred silence incidents (`CENTRE_LOSS_FRACTION`) require $D \ge 5$, `silent_fraction >= 0.6`, non-grace, and non-stalled state.
 - **Audit Verification & Notice Delivery:** Incident state transitions (`opened`, `reclassified`, `escalated`, `recovering`, `resolved`) append an audit log entry with entry_type `"incident"`. Background ticks without status transitions produce zero audit spam. Multi-audience notices are delivered to admin and centre targets upon transition.
+
+---
+
+## 13. Phase 3b-i Schema Extensions & Impact Engine Decisions
+- **`incident_impacts` Table Extensions:** Added columns `evidence TEXT` (canonical JSON storing exact event IDs used and baseline quality metrics), `computed_at TEXT` (ISO timestamp of computation), and `impact_version INTEGER DEFAULT 1`. Primary key remains `(incident_id, candidate_id)`.
+- **`incidents` Table Extensions:** Added column `impact_computed_at TEXT` recording the timestamp when the post-resolution impact assessment was executed.
+- **`review_queue` Table Specification:** Defined table with primary key `review_id` and unique constraint `(incident_id, candidate_id)` enforced via `idx_review_queue_inc_cand`. Valid status values: `pending`, `superseded`, `resolved`. Added index `idx_review_queue_status`.
+- **Simulator Ground Truth Metrics:** Added per-candidate fields `lost_s_from_fault_start` (difference between candidate `resumed_ts` and fault `start_ts` for power_loss, 0 for network_drop) and `expected_lost_answers` (`unsaved_answers_at_start` for power_loss, 0 for network_drop). These remain strictly confined to the simulator process and test fixtures; never imported or read by `app/`.
+- **Exposed Set Isolation:** Exposed candidate sessions are derived deterministically from the events and session records of the incident centre with `started_at <= window_start` and not submitted before `window_start`. Unaffected centres are strictly excluded.
+- **Pure-Function Remedy Evaluation:** Pure typed Python logic with zero `eval()`/`exec()`. Evaluates strictly in order R3 -> R4 -> R1 -> R2 using configurable thresholds from `config.yaml`.
+

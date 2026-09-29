@@ -121,7 +121,8 @@ CREATE TABLE IF NOT EXISTS incidents (
     window_end TEXT,
     resolved_at TEXT,
     detection_rule TEXT,
-    evidence TEXT
+    evidence TEXT,
+    impact_computed_at TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_incidents_active_centre
@@ -142,7 +143,7 @@ CREATE TABLE IF NOT EXISTS incident_impacts (
     incident_id TEXT REFERENCES incidents(incident_id),
     candidate_id TEXT REFERENCES candidates(candidate_id),
     session_id TEXT,
-    lost_seconds INTEGER,
+    lost_seconds REAL,
     unsaved_answers INTEGER,
     last_good_seq INTEGER,
     evidence_quality TEXT,
@@ -150,6 +151,9 @@ CREATE TABLE IF NOT EXISTS incident_impacts (
     extra_seconds INTEGER,
     rationale TEXT,
     rule_id TEXT,
+    evidence TEXT,
+    computed_at TEXT,
+    impact_version INTEGER DEFAULT 1,
     PRIMARY KEY (incident_id, candidate_id)
 );
 
@@ -166,13 +170,19 @@ CREATE TABLE IF NOT EXISTS decisions (
 
 CREATE TABLE IF NOT EXISTS review_queue (
     review_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    incident_id TEXT,
-    candidate_id TEXT,
+    incident_id TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    session_id TEXT,
     reason TEXT,
     status TEXT DEFAULT 'pending',
     assignee TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    updated_at TEXT,
+    UNIQUE (incident_id, candidate_id)
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_review_queue_inc_cand ON review_queue(incident_id, candidate_id);
+CREATE INDEX IF NOT EXISTS idx_review_queue_status ON review_queue(status);
 
 CREATE TABLE IF NOT EXISTS notices (
     notice_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -289,4 +299,30 @@ def init_db(db_path: Optional[str] = None) -> None:
         cols = {row["name"] for row in cursor.fetchall()}
         if cols and "last_ingested_at" not in cols:
             cursor.execute("ALTER TABLE sessions ADD COLUMN last_ingested_at TEXT;")
+
+        cursor.execute("PRAGMA table_info(incident_impacts);")
+        ii_cols = {row["name"] for row in cursor.fetchall()}
+        if ii_cols:
+            if "evidence" not in ii_cols:
+                cursor.execute("ALTER TABLE incident_impacts ADD COLUMN evidence TEXT;")
+            if "computed_at" not in ii_cols:
+                cursor.execute("ALTER TABLE incident_impacts ADD COLUMN computed_at TEXT;")
+            if "impact_version" not in ii_cols:
+                cursor.execute("ALTER TABLE incident_impacts ADD COLUMN impact_version INTEGER DEFAULT 1;")
+
+        cursor.execute("PRAGMA table_info(incidents);")
+        inc_cols = {row["name"] for row in cursor.fetchall()}
+        if inc_cols and "impact_computed_at" not in inc_cols:
+            cursor.execute("ALTER TABLE incidents ADD COLUMN impact_computed_at TEXT;")
+
+        cursor.execute("PRAGMA table_info(review_queue);")
+        rq_cols = {row["name"] for row in cursor.fetchall()}
+        if rq_cols:
+            if "session_id" not in rq_cols:
+                cursor.execute("ALTER TABLE review_queue ADD COLUMN session_id TEXT;")
+            if "updated_at" not in rq_cols:
+                cursor.execute("ALTER TABLE review_queue ADD COLUMN updated_at TEXT;")
+
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_review_queue_inc_cand ON review_queue(incident_id, candidate_id);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_review_queue_status ON review_queue(status);")
         cursor.close()

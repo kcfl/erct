@@ -595,9 +595,9 @@ def test_11_audit_entries_real_transitions_only(fresh_db: str):
     # Check audit entries count for entry_type = 'incident' for INC-C-BPL-01-1
     with get_db_connection(fresh_db) as conn:
         inc_audit_rows = conn.execute("SELECT seq, payload FROM audit_log WHERE entry_type = 'incident' AND ref_id = 'INC-C-BPL-01-1';").fetchall()
-        assert len(inc_audit_rows) == 4, f"Expected 4 audit entries (opened, escalated, recovering, resolved), got {len(inc_audit_rows)}"
+        assert len(inc_audit_rows) == 5, f"Expected 5 audit entries (opened, escalated, recovering, resolved, impact_computed), got {len(inc_audit_rows)}"
         actions = [json.loads(r["payload"])["action"] for r in inc_audit_rows]
-        assert actions == ["opened", "escalated", "recovering", "resolved"]
+        assert actions == ["opened", "escalated", "recovering", "resolved", "impact_computed"]
 
     audit_res = verify_audit_chain(fresh_db)
     assert audit_res.ok is True
@@ -731,3 +731,108 @@ def test_12_and_13_restart_safety_and_detection_latency(tmp_path: Path):
                 p1.wait(timeout=3.0)
             except Exception:
                 p1.kill()
+
+
+# ---------------------------------------------------------------------------
+# TEST 14: Session state timeline (interrupted on Rule A, resumed after window_end, under_review/submitted immutable)
+# ---------------------------------------------------------------------------
+def test_14_session_state_timeline_and_guards(fresh_db: str):
+    t0 = datetime(2026, 9, 29, 12, 0, 0, tzinfo=timezone.utc)
+    engine = DetectionEngine(fresh_db)
+    engine.reset_start_time(t0 - timedelta(seconds=60))
+
+    # Pick two sessions in C-BPL-02 to mark as 'under_review' and 'submitted'
+    with get_db_connection(fresh_db) as conn:
+        sessions = conn.execute("SELECT session_id FROM sessions WHERE centre_id = 'C-BPL-02' ORDER BY session_id;").fetchall()
+        s_review = sessions[0]["session_id"]
+        s_submitted = sessions[1]["session_id"]
+        conn.execute("UPDATE sessions SET state = 'under_review' WHERE session_id = ?;", (s_review,))
+        conn.execute("UPDATE sessions SET state = 'submitted' WHERE session_id = ?;", (s_submitted,))
+        conn.commit()
+
+    # Insert explicit POWER_LOSS event for C-BPL-02
+    ev_pl = {
+        "event_id": "ev-pl-test14",
+        "exam_id": "EX-2026-PS6-01",
+        "centre_id": "C-BPL-02",
+        "seq": 100,
+        "ts": format_utc_iso(t0),
+        "type": "POWER_LOSS",
+        "severity": "critical",
+        "payload": json.dumps({"source": "grid", "backup_minutes": 0}),
+        "ingested_at": format_utc_iso(t0),
+    }
+    with get_db_connection(fresh_db) as conn:
+        conn.execute(
+            """
+            INSERT INTO events (event_id, exam_id, centre_id, seq, ts, type, severity, payload, ingested_at)
+            VALUES (:event_id, :exam_id, :centre_id, :seq, :ts, :type, :severity, :payload, :ingested_at);
+            """,
+            ev_pl,
+        )
+        conn.commit()
+
+    keep_centres_alive(fresh_db, ["C-BPL-01", "C-BPL-03", "C-BPL-04", "C-BPL-05"], t0)
+    engine.tick(t0)
+
+    # Check session states: 38 must be 'interrupted', 1 'under_review', 1 'submitted'
+    with get_db_connection(fresh_db) as conn:
+        intr_count = conn.execute("SELECT COUNT(*) AS c FROM sessions WHERE centre_id = 'C-BPL-02' AND state = 'interrupted';").fetchone()["c"]
+        rev_count = conn.execute("SELECT COUNT(*) AS c FROM sessions WHERE session_id = ? AND state = 'under_review';", (s_review,)).fetchone()["c"]
+        sub_count = conn.execute("SELECT COUNT(*) AS c FROM sessions WHERE session_id = ? AND state = 'submitted';", (s_submitted,)).fetchone()["c"]
+        assert intr_count == 38, f"Expected 38 interrupted sessions, found {intr_count}"
+        assert rev_count == 1, "Session with 'under_review' must not be touched"
+        assert sub_count == 1, "Session with 'submitted' must not be touched"
+
+        inc = conn.execute("SELECT incident_id, window_start, window_end FROM incidents WHERE centre_id = 'C-BPL-02';").fetchone()
+        inc_id = inc["incident_id"]
+
+    # Now simulate recovery: insert POWER_RESTORED and set window_end
+    t_res = t0 + timedelta(seconds=60)
+    ev_pr = {
+        "event_id": "ev-pr-test14",
+        "exam_id": "EX-2026-PS6-01",
+        "centre_id": "C-BPL-02",
+        "seq": 101,
+        "ts": format_utc_iso(t_res),
+        "type": "POWER_RESTORED",
+        "severity": "info",
+        "payload": json.dumps({"source": "grid"}),
+        "ingested_at": format_utc_iso(t_res),
+    }
+    with get_db_connection(fresh_db) as conn:
+        conn.execute(
+            """
+            INSERT INTO events (event_id, exam_id, centre_id, seq, ts, type, severity, payload, ingested_at)
+            VALUES (:event_id, :exam_id, :centre_id, :seq, :ts, :type, :severity, :payload, :ingested_at);
+            """,
+            ev_pr,
+        )
+        conn.commit()
+
+    keep_centres_alive(fresh_db, ["C-BPL-01", "C-BPL-03", "C-BPL-04", "C-BPL-05"], t_res)
+    engine.tick(t_res)
+
+    # Now send heartbeats for 20 interrupted sessions with ts > window_end
+    t_hb = t_res + timedelta(seconds=10)
+    with get_db_connection(fresh_db) as conn:
+        conn.execute(
+            f"""
+            UPDATE sessions SET last_heartbeat_at = '{format_utc_iso(t_hb)}'
+            WHERE session_id IN (SELECT session_id FROM sessions WHERE centre_id = 'C-BPL-02' AND state = 'interrupted' LIMIT 20);
+            """
+        )
+        conn.commit()
+
+    keep_centres_alive(fresh_db, ["C-BPL-01", "C-BPL-03", "C-BPL-04", "C-BPL-05"], t_hb)
+    set_centre_liveness(fresh_db, "C-BPL-02", format_utc_iso(t_hb))
+    engine.tick(t_hb)
+
+    with get_db_connection(fresh_db) as conn:
+        res_count = conn.execute("SELECT COUNT(*) AS c FROM sessions WHERE centre_id = 'C-BPL-02' AND state = 'resumed';").fetchone()["c"]
+        still_intr = conn.execute("SELECT COUNT(*) AS c FROM sessions WHERE centre_id = 'C-BPL-02' AND state = 'interrupted';").fetchone()["c"]
+        rev_count2 = conn.execute("SELECT COUNT(*) AS c FROM sessions WHERE session_id = ? AND state = 'under_review';", (s_review,)).fetchone()["c"]
+        assert res_count == 20, f"Expected 20 resumed sessions, found {res_count}"
+        assert still_intr == 18, f"Expected 18 still interrupted, found {still_intr}"
+        assert rev_count2 == 1, "'under_review' must still remain untouched"
+
