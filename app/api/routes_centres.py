@@ -53,7 +53,7 @@ def get_centres() -> List[Dict[str, Any]]:
                 """
                 SELECT session_id, last_ingested_at, state
                 FROM sessions
-                WHERE centre_id = ? AND started_at IS NOT NULL AND state IN ('active', 'resumed', 'interrupted');
+                WHERE centre_id = ? AND started_at IS NOT NULL AND state IN ('active', 'resumed', 'interrupted', 'under_review');
                 """,
                 (cid,),
             )
@@ -95,10 +95,10 @@ def get_centres() -> List[Dict[str, Any]]:
                 last_age_s = round(max(0.0, (now - parse_utc_iso(live_row["last_ingested_at"])).total_seconds()), 2)
 
             # 6. Status determination:
-            # - down: when an incident is open or recovering
+            # - down: when an incident is open or recovering, or silent_fraction >= 0.6
             # - degraded: when 0.2 < silent_fraction < 0.6
-            # - healthy: otherwise
-            if open_inc_id:
+            # - healthy: otherwise (silent_fraction <= 0.2 and no open/recovering incident)
+            if open_inc_id or silent_fraction >= 0.6:
                 centre_status = "down"
             elif 0.2 < silent_fraction < 0.6:
                 centre_status = "degraded"

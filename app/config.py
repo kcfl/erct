@@ -101,6 +101,7 @@ class ImpactConfig(BaseModel):
     stale_hb_factor: float = 2.5
     baseline_slots: int = 10
     baseline_missing_max: float = 0.2
+    baseline_min_slots: int = 3
     recompute_window_s: float = 600.0
 
 
@@ -109,6 +110,19 @@ class RemedyConfig(BaseModel):
     resume_max_lost_answers: int = 2
     extra_time_buffer_s: float = 120.0
     retest_min_affected_fraction: float = 0.5
+
+
+class DecisionConfig(BaseModel):
+    controller_key: str = "demo-controller-key"
+    max_extra_seconds: int = 1800
+    min_reason_chars: int = 10
+    allowed_remedies: List[str] = Field(default_factory=lambda: ["resume", "extra_time", "retest", "no_compensation"])
+
+
+class FairnessConfig(BaseModel):
+    min_rows_per_centre: int = 10
+    max_ratio_spread: float = 1.5
+    max_manual_review_gap: float = 0.3
 
 
 class RemedyRuleConfig(BaseModel):
@@ -125,6 +139,7 @@ class RemedyFairnessConfig(BaseModel):
 
 class CommsConfig(BaseModel):
     candidate_message_delay_s: int = 30
+    display_tz: str = "Asia/Kolkata"
 
 
 class AuditImmudbConfig(BaseModel):
@@ -147,6 +162,8 @@ class AppConfig(BaseModel):
     integrity: IntegrityConfig = Field(default_factory=IntegrityConfig)
     impact: ImpactConfig = Field(default_factory=ImpactConfig)
     remedy: RemedyConfig = Field(default_factory=RemedyConfig)
+    decision: DecisionConfig = Field(default_factory=DecisionConfig)
+    fairness: FairnessConfig = Field(default_factory=FairnessConfig)
     remedy_rules: List[RemedyRuleConfig] = Field(default_factory=list)
     remedy_fairness: RemedyFairnessConfig = Field(default_factory=RemedyFairnessConfig)
     comms: CommsConfig = Field(default_factory=CommsConfig)

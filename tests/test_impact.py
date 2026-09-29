@@ -330,6 +330,50 @@ def test_03_evidence_quality():
     q6 = compute_session_facts(pre_hbs + [post_hb], session, ws, we, cfg)
     assert q6.evidence_quality == "strong"
 
+    # Step 1.b Baseline requirements:
+    # (a) 5 regular heartbeats since start => strong
+    t_ws = parse_iso(ws)
+    t_start_5 = t_ws - timedelta(seconds=10)  # 5 slots of 2.0s
+    sess_5 = {"session_id": "SES-B1", "candidate_id": "C-B1", "centre_id": "C-BPL-02", "started_at": format_iso(t_start_5)}
+    hbs_5 = [
+        {"event_id": f"hb-5-{i}", "type": "HEARTBEAT", "ts": format_iso(t_start_5 + timedelta(seconds=i * 2)), "payload": {"local_seq": i}}
+        for i in range(1, 6)
+    ]
+    q_b1 = compute_session_facts(hbs_5 + [post_hb], sess_5, ws, we, cfg)
+    assert q_b1.evidence_quality == "strong", f"5 regular heartbeats must be strong, got {q_b1.evidence_quality}: {q_b1.quality_details}"
+
+    # (b) 2 heartbeats only since start => partial ("too little history")
+    t_start_2 = t_ws - timedelta(seconds=4)  # 2 slots only (< min 3)
+    sess_2 = {"session_id": "SES-B2", "candidate_id": "C-B2", "centre_id": "C-BPL-02", "started_at": format_iso(t_start_2)}
+    hbs_2 = [
+        {"event_id": f"hb-2-{i}", "type": "HEARTBEAT", "ts": format_iso(t_start_2 + timedelta(seconds=i * 2)), "payload": {"local_seq": i}}
+        for i in range(1, 3)
+    ]
+    q_b2 = compute_session_facts(hbs_2 + [post_hb], sess_2, ws, we, cfg)
+    assert q_b2.evidence_quality == "partial"
+    assert "too little history" in q_b2.quality_details.get("reason", "")
+
+    # (c) 5 available slots with 3 missing => partial
+    hbs_5_missing = [
+        {"event_id": f"hb-5m-{i}", "type": "HEARTBEAT", "ts": format_iso(t_start_5 + timedelta(seconds=i * 2)), "payload": {"local_seq": i}}
+        for i in [2, 5]  # only 2 of 5 slots present, 3 missing (60% missing)
+    ]
+    q_b3 = compute_session_facts(hbs_5_missing + [post_hb], sess_5, ws, we, cfg)
+    assert q_b3.evidence_quality == "partial"
+    assert "baseline missing slots" in q_b3.quality_details.get("reason", "")
+
+    # (d) Flaky pattern (~40% missing over 10 slots) => partial
+    t_start_10 = t_ws - timedelta(seconds=20)
+    sess_10 = {"session_id": "SES-B4", "candidate_id": "C-B4", "centre_id": "C-BPL-02", "started_at": format_iso(t_start_10)}
+    # 10 slots: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9; provide 6 heartbeats (40% missing)
+    hbs_flaky_10 = [
+        {"event_id": f"hb-10-{i}", "type": "HEARTBEAT", "ts": format_iso(t_start_10 + timedelta(seconds=i * 2)), "payload": {"local_seq": i}}
+        for i in [1, 3, 5, 7, 8, 10]
+    ]
+    q_b4 = compute_session_facts(hbs_flaky_10 + [post_hb], sess_10, ws, we, cfg)
+    assert q_b4.evidence_quality == "partial"
+    assert "baseline missing slots" in q_b4.quality_details.get("reason", "")
+
 
 # ---------------------------------------------------------------------------
 # UNIT TEST 4: Exposed set
@@ -714,9 +758,8 @@ def test_09_accuracy_power_loss(tmp_path: Path):
         # (a) Candidate set equals truth set exactly (100% listed, 0 extra, 0 from other centres)
         assert set(impact_rows.keys()) == set(truth_cands.keys()), "Candidate set must match truth set exactly"
 
+        stale_tol = 5.0  # Independent constant (5.0 s), NOT derived from cfg.impact.*
         app_cfg = get_config()
-        stale_factor = app_cfg.impact.stale_hb_factor
-        stale_tol = stale_factor * interval_s
 
         strong_count = 0
         partial_count = 0

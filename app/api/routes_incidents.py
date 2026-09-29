@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
+from app.config import get_config
 from app.db import get_db_connection
 
 router = APIRouter(prefix="/v1/incidents", tags=["Incidents"])
@@ -127,8 +128,10 @@ def get_incident_impact(
     incident_id: str,
     remedy: Optional[str] = None,
     quality: Optional[str] = None,
+    decision: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Retrieve computed impact analysis and remedy recommendations for an incident."""
+    cfg = get_config()
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM incidents WHERE incident_id = ?;", (incident_id,))
@@ -158,6 +161,21 @@ def get_incident_impact(
                 evidence_parsed = {}
         summary = evidence_parsed.get("impact_summary")
 
+        # Fetch latest decisions for this incident
+        cursor.execute(
+            """
+            SELECT decision_id, candidate_id, mode, remedy, extra_seconds, decided_by, decided_at
+            FROM decisions
+            WHERE incident_id = ?
+            ORDER BY decision_id ASC;
+            """,
+            (incident_id,),
+        )
+        dec_rows = cursor.fetchall()
+        latest_decisions: Dict[str, Any] = {}
+        for dr in dec_rows:
+            latest_decisions[dr["candidate_id"]] = dict(dr)
+
         query = "SELECT * FROM incident_impacts WHERE incident_id = ?"
         params: List[Any] = [incident_id]
         if remedy:
@@ -170,16 +188,56 @@ def get_incident_impact(
 
         cursor.execute(query, params)
         raw_rows = cursor.fetchall()
+
+        # Update summary with decision counts and fairness status
+        if summary:
+            from app.core.fairness import compute_exam_fairness
+            total_exp = summary.get("exposed", len(raw_rows))
+            decided_count = len(latest_decisions)
+            pending_count = max(0, total_exp - decided_count)
+            summary["pending_decisions"] = pending_count
+            summary["decided"] = decided_count
+            fairness = compute_exam_fairness(conn, inc["exam_id"], cfg)
+            summary["fairness_status"] = fairness["status"]
+
         cursor.close()
 
         formatted_rows = []
         for r in raw_rows:
+            cand_id = r["candidate_id"]
+            d = latest_decisions.get(cand_id)
+            if d:
+                dec_block = {
+                    "status": d["mode"],  # 'approved' or 'overridden'
+                    "decision_id": d["decision_id"],
+                    "remedy": d["remedy"],
+                    "extra_seconds": d["extra_seconds"],
+                    "decided_by": d["decided_by"],
+                    "decided_at": d["decided_at"],
+                }
+            else:
+                dec_block = {
+                    "status": "pending",
+                    "decision_id": None,
+                    "remedy": None,
+                    "extra_seconds": None,
+                    "decided_by": None,
+                    "decided_at": None,
+                }
+
+            # Filter by decision status if requested
+            if decision == "pending" and dec_block["status"] != "pending":
+                continue
+            if decision == "decided" and dec_block["status"] not in ("approved", "overridden"):
+                continue
+
             ev_dict = {}
             if r["evidence"]:
                 try:
                     ev_dict = json.loads(r["evidence"])
                 except Exception:
                     ev_dict = {}
+
             formatted_rows.append({
                 "incident_id": r["incident_id"],
                 "candidate_id": r["candidate_id"],
@@ -195,6 +253,7 @@ def get_incident_impact(
                 "evidence": ev_dict,
                 "computed_at": r["computed_at"],
                 "impact_version": r["impact_version"],
+                "decision": dec_block,
             })
 
     return {

@@ -201,7 +201,7 @@ class StoreAndForwardBuffer:
 
         return inserted
 
-    def get_pending_count(self, centre_id: Optional[str] = None) -> int:
+    def get_pending_count(self, centre_id: Optional[str] = None, exclude_paused: bool = False) -> int:
         """Return the count of unconfirmed events pending in the buffer."""
         with self._lock, self._get_connection() as conn:
             if centre_id:
@@ -209,6 +209,16 @@ class StoreAndForwardBuffer:
                     "SELECT COUNT(*) AS c FROM outbound_events WHERE centre_id = ?;",
                     (centre_id,),
                 )
+            elif exclude_paused:
+                paused = self.get_paused_centres()
+                if paused:
+                    placeholders = ",".join("?" for _ in paused)
+                    cursor = conn.execute(
+                        f"SELECT COUNT(*) AS c FROM outbound_events WHERE centre_id NOT IN ({placeholders});",
+                        list(paused),
+                    )
+                else:
+                    cursor = conn.execute("SELECT COUNT(*) AS c FROM outbound_events;")
             else:
                 cursor = conn.execute("SELECT COUNT(*) AS c FROM outbound_events;")
             row = cursor.fetchone()

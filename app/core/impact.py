@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import AppConfig, get_config
 from app.core.audit_chain import append_audit_entry
+from app.core.notices import emit_notice
 from app.db import write_transaction
 
 
@@ -62,6 +63,7 @@ class RemedyDecision:
     remedy: str   # 'resume' | 'extra_time' | 'retest_recommended' | 'manual_review'
     extra_seconds: int
     rationale: str
+    fallback: Optional[Dict[str, Any]] = None
 
 
 def compute_session_facts(
@@ -185,7 +187,7 @@ def compute_session_facts(
         is_partial = False
         reasons = []
 
-        # Stale check: if last heartbeat is older than 1.8 * interval before window_start,
+        # Stale check: if last heartbeat older than 1.8 * interval before window_start,
         # telemetry at fault inception is unobserved and potentially desynchronized
         stale_s = (ws_dt - last_good_dt).total_seconds() if ws_dt and last_good_dt else 0.0
         effective_stale_factor = min(stale_factor, 1.8)
@@ -201,27 +203,46 @@ def compute_session_facts(
 
         # Baseline regularity check
         if ws_dt:
-            baseline_span = baseline_slots_count * interval
-            baseline_start = ws_dt - timedelta(seconds=baseline_span)
-            missing_slots = 0
+            # Slots = the last baseline_slots interval slots before window_start,
+            # clipped to the session start
+            session_started_at = session.get("started_at")
+            started_dt = parse_iso(session_started_at) if session_started_at else None
+
+            available_slots = []
             for slot_idx in range(baseline_slots_count):
-                slot_t0 = baseline_start + timedelta(seconds=slot_idx * interval)
-                slot_t1 = baseline_start + timedelta(seconds=(slot_idx + 1) * interval)
-                slot_has_hb = any(
-                    slot_t0 + timedelta(seconds=1e-4) < hb["ts_dt"] <= slot_t1 + timedelta(seconds=1e-4)
-                    for hb in pre_window_hbs
-                )
-                if not slot_has_hb:
-                    missing_slots += 1
+                slot_t0 = ws_dt - timedelta(seconds=(baseline_slots_count - slot_idx) * interval)
+                slot_t1 = ws_dt - timedelta(seconds=(baseline_slots_count - slot_idx - 1) * interval)
+                # Clip to session start: slot must be at or after the session's started_at
+                if started_dt is None or slot_t0 >= (started_dt - timedelta(seconds=1e-4)):
+                    available_slots.append((slot_t0, slot_t1))
 
-            missing_frac = missing_slots / baseline_slots_count
-            quality_details["baseline_slots"] = baseline_slots_count
-            quality_details["missing_slots"] = missing_slots
-            quality_details["missing_fraction"] = round(missing_frac, 2)
-
-            if missing_frac > baseline_missing_max:
+            baseline_min_slots = getattr(cfg.impact, "baseline_min_slots", 3)
+            if len(available_slots) < baseline_min_slots:
                 is_partial = True
-                reasons.append(f"baseline missing slots {missing_slots}/{baseline_slots_count} ({missing_frac:.1%}) > {baseline_missing_max:.1%}")
+                reasons.append(f"too little history ({len(available_slots)} available slots < {baseline_min_slots})")
+                quality_details["baseline_slots"] = len(available_slots)
+                quality_details["missing_slots"] = 0
+                quality_details["missing_fraction"] = 1.0
+            else:
+                missing_slots = 0
+                for slot_t0, slot_t1 in available_slots:
+                    slot_has_hb = any(
+                        slot_t0 < hb["ts_dt"] <= slot_t1
+                        for hb in pre_window_hbs
+                    )
+                    if not slot_has_hb:
+                        missing_slots += 1
+
+                missing_frac = missing_slots / len(available_slots)
+                quality_details["baseline_slots"] = len(available_slots)
+                quality_details["missing_slots"] = missing_slots
+                quality_details["missing_fraction"] = round(missing_frac, 2)
+
+                if missing_frac > baseline_missing_max:
+                    is_partial = True
+                    reasons.append(
+                        f"baseline missing slots {missing_slots}/{len(available_slots)} ({round(missing_frac * 100, 1)}%) > {round(baseline_missing_max * 100, 1)}%"
+                    )
 
         if is_partial:
             evidence_quality = "partial"
@@ -279,6 +300,21 @@ def evaluate_remedy(
     integrity_flag = bool(incident_facts.get("integrity_flag", False))
 
     if centre_affected_fraction >= remedy_cfg.retest_min_affected_fraction and integrity_flag:
+        # Fallback evaluation for R1 vs R2
+        if facts.lost_s <= remedy_cfg.resume_max_lost_s and facts.lost_answers <= remedy_cfg.resume_max_lost_answers:
+            fb_rule = "R1"
+            fb_rem = "resume"
+            fb_extra = math.ceil(facts.lost_s) if facts.lost_s > 0 else 0
+        else:
+            fb_rule = "R2"
+            fb_rem = "extra_time"
+            fb_extra = math.ceil(facts.lost_s) + int(remedy_cfg.extra_time_buffer_s)
+
+        fallback_dict = {
+            "rule_id": fb_rule,
+            "remedy": fb_rem,
+            "extra_seconds": fb_extra,
+        }
         return RemedyDecision(
             rule_id="R4",
             remedy="retest_recommended",
@@ -288,6 +324,7 @@ def evaluate_remedy(
                 f"{remedy_cfg.retest_min_affected_fraction:.1%} with integrity flag active. "
                 "Retest recommended for centre."
             ),
+            fallback=fallback_dict,
         )
 
     # R1: Minor Interruption (Session Resumed)
@@ -461,7 +498,7 @@ def compute_incident_impact(
 
     # 6. Read existing incident_impacts to detect changes and prevent audit spam
     cursor.execute(
-        "SELECT candidate_id, remedy_recommended, evidence_quality FROM incident_impacts WHERE incident_id = ?;",
+        "SELECT candidate_id, remedy_recommended, extra_seconds, rule_id, evidence_quality, impact_version FROM incident_impacts WHERE incident_id = ?;",
         (incident_id,),
     )
     existing_rows = {row["candidate_id"]: dict(row) for row in cursor.fetchall()}
@@ -486,7 +523,19 @@ def compute_incident_impact(
         is_new = existing is None
         has_remedy_changed = existing is not None and existing["remedy_recommended"] != dec.remedy
 
-        evidence_payload_json = json.dumps(facts.quality_details)
+        if is_new:
+            impact_version = 1
+        else:
+            prev_ver = existing.get("impact_version") or 1
+            if has_remedy_changed or existing.get("extra_seconds") != dec.extra_seconds or existing.get("rule_id") != dec.rule_id:
+                impact_version = prev_ver + 1
+            else:
+                impact_version = prev_ver
+
+        evidence_dict = dict(facts.quality_details)
+        if dec.fallback:
+            evidence_dict["fallback"] = dec.fallback
+        evidence_payload_json = json.dumps(evidence_dict)
 
         # Upsert impact row
         cursor.execute(
@@ -495,7 +544,7 @@ def compute_incident_impact(
                 incident_id, candidate_id, session_id, lost_seconds, unsaved_answers,
                 last_good_seq, evidence_quality, remedy_recommended, extra_seconds,
                 rationale, rule_id, evidence, computed_at, impact_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (incident_id, candidate_id) DO UPDATE SET
                 session_id = excluded.session_id,
                 lost_seconds = excluded.lost_seconds,
@@ -508,7 +557,7 @@ def compute_incident_impact(
                 rule_id = excluded.rule_id,
                 evidence = excluded.evidence,
                 computed_at = excluded.computed_at,
-                impact_version = incident_impacts.impact_version + 1;
+                impact_version = excluded.impact_version;
             """,
             (
                 incident_id,
@@ -524,6 +573,7 @@ def compute_incident_impact(
                 dec.rule_id,
                 evidence_payload_json,
                 computed_at_iso,
+                impact_version,
             ),
         )
 
@@ -546,6 +596,24 @@ def compute_incident_impact(
                 ts_iso=computed_at_iso,
                 conn=conn,
             )
+
+        # Candidate notices: impact_pending or review_pending keyed by impact_version
+        cand_kind = "review_pending" if dec.remedy == "manual_review" else "impact_pending"
+        if dec.remedy == "manual_review":
+            cand_msg = f"Your session requires manual review by the exam team. Your last confirmed save is #{facts.S}. An update will be provided once reviewed."
+        else:
+            cand_msg = f"The effect of the interruption on your session has been assessed. Your remedy is awaiting final confirmation by the exam controller. Your last confirmed save is #{facts.S}."
+
+        emit_notice(
+            conn=conn,
+            audience="candidate",
+            target_id=cand_id,
+            incident_id=incident_id,
+            kind=cand_kind,
+            ref_key=f"{cand_kind}:{incident_id}:{cand_id}:{impact_version}",
+            message=cand_msg,
+            now_iso=computed_at_iso,
+        )
 
         # Side effects for manual_review
         if dec.remedy == "manual_review":
@@ -612,7 +680,44 @@ def compute_incident_impact(
             conn=conn,
         )
 
-    # 9. Update incident record
+    # 9. Institutional notices: Admin and centre notices
+    cursor.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM incident_impacts i
+        LEFT JOIN decisions d ON d.incident_id = i.incident_id AND d.candidate_id = i.candidate_id
+        WHERE i.incident_id = ? AND d.decision_id IS NULL;
+        """,
+        (incident_id,),
+    )
+    pending_decisions = cursor.fetchone()["c"]
+    summary_str = ", ".join(f"{k}: {v}" for k, v in by_remedy.items())
+    admin_msg = f"Impact assessment completed for incident {incident_id}. Breakdown: {summary_str}. Pending decisions: {pending_decisions}."
+    centre_msg = f"Impact assessment completed for incident {incident_id}. Breakdown: {summary_str}. Pending decisions: {pending_decisions}."
+
+    inst_run = computed_at_iso if (not was_previously_computed or new_or_changed_count > 0) else "initial"
+    emit_notice(
+        conn=conn,
+        audience="admin",
+        target_id=None,
+        incident_id=incident_id,
+        kind="impact_ready",
+        ref_key=f"impact_ready:admin:{incident_id}:{inst_run}",
+        message=admin_msg,
+        now_iso=computed_at_iso,
+    )
+    emit_notice(
+        conn=conn,
+        audience="centre",
+        target_id=cid,
+        incident_id=incident_id,
+        kind="impact_ready",
+        ref_key=f"impact_ready:centre:{incident_id}:{cid}:{inst_run}",
+        message=centre_msg,
+        now_iso=computed_at_iso,
+    )
+
+    # 10. Update incident record
     evidence_dict["centre_affected_fraction"] = round(centre_affected_fraction, 4)
     evidence_dict["impact_summary"] = summary_dict
     evidence_dict["centre_retest_recommended"] = centre_retest

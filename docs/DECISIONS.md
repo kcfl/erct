@@ -159,3 +159,13 @@ First match wins, strictly evaluated in order **R3 -> R4 -> R1 -> R2**:
 - **Exposed Set Isolation:** Exposed candidate sessions are derived deterministically from the events and session records of the incident centre with `started_at <= window_start` and not submitted before `window_start`. Unaffected centres are strictly excluded.
 - **Pure-Function Remedy Evaluation:** Pure typed Python logic with zero `eval()`/`exec()`. Evaluates strictly in order R3 -> R4 -> R1 -> R2 using configurable thresholds from `config.yaml`.
 
+---
+
+## 14. Phase 3b-ii Decisions, Fairness Gate & Candidate Communications Decisions
+- **`decisions` Table Extensions:** Added columns `extra_seconds INTEGER`, `rule_id TEXT`, `recommended_remedy TEXT`, `impact_version INTEGER`, `supersedes INTEGER`, `acknowledged_fairness INTEGER DEFAULT 0`, `fairness_snapshot TEXT` (JSON), and `decided_at TEXT`. Index on `(incident_id, candidate_id, decision_id)`.
+- **Deliberate Design Choice — No 'auto' Mode:** Mode is strictly `'approved'` or `'overridden'`. Mode `'auto'` is deliberately excluded: every remedy requires an explicit human decision by an exam controller or proctor, ensuring complete institutional accountability.
+- **`notices` Table Extensions & Idempotency:** Added columns `kind TEXT` and `ref_key TEXT` with a unique index on `ref_key` (`idx_notices_ref_key`). Notice creation is guaranteed idempotent; duplicate notifications cannot be generated under retries or multiple ticks.
+- **Fairness Gate:** Evaluates cross-centre fairness across all resolved incidents for an exam. Flags anomalies when `ratio_spread > 1.5` or `manual_review_gap > 0.3` for centres meeting `min_rows_per_centre`. Bulk approvals are gated: if the exam is flagged, `POST /v1/incidents/{incident_id}/decisions/approve-all` is rejected with HTTP 409 unless `acknowledge_fairness: true` is supplied.
+- **Controller Authorization & Privacy:** Controller mutations require header `X-Controller-Key`. GET endpoints remain open (roles come later). Candidate status endpoint (`GET /v1/status/{candidate_id}`) enforces strict data isolation: only the specific candidate's confirmed status is returned; unconfirmed remedy recommendations and decision reasons are strictly hidden.
+
+

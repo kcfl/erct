@@ -110,6 +110,7 @@ impact:
   stale_hb_factor: 2.5           # last heartbeat older than factor*interval before window_start => evidence partial
   baseline_slots: 10             # interval slots before window_start used to judge heartbeat regularity
   baseline_missing_max: 0.2      # more missing slots than this => evidence partial
+  baseline_min_slots: 3          # minimum required slots after session start
   recompute_window_s: 600        # keep refreshing rows that are still 'missing'
 
 remedy:
@@ -118,11 +119,20 @@ remedy:
   extra_time_buffer_s: 120
   retest_min_affected_fraction: 0.5
 
-remedy_fairness:
-  max_extra_time_disparity_s: 300
+decision:
+  controller_key: "demo-controller-key"     # demo only, say so in the README later
+  max_extra_seconds: 1800
+  min_reason_chars: 10
+  allowed_remedies: [resume, extra_time, retest, no_compensation]
+
+fairness:
+  min_rows_per_centre: 10
+  max_ratio_spread: 1.5          # max(compensation_ratio) / min(compensation_ratio)
+  max_manual_review_gap: 0.3     # difference in manual-review share between centres
 
 comms:
-  candidate_message_delay_s: 30
+  candidate_message_delay_s: 30  # keep; used as the target latency
+  display_tz: "Asia/Kolkata"     # only for times inside message text; storage stays UTC
 
 audit:
   anchor_every: 200

@@ -12,6 +12,8 @@ from app.api.routes_ingest import router as ingest_router
 from app.api.routes_control import router as control_router
 from app.api.routes_centres import router as centres_router
 from app.api.routes_incidents import router as incidents_router, review_router
+from app.api.routes_decisions import router as decisions_router
+from app.api.routes_status import router as status_router
 from app.config import get_config
 from app.core.audit_chain import append_audit_entry, verify_audit_chain
 from app.core.detection import DetectionEngine, DetectionWorker, parse_utc_iso
@@ -171,6 +173,8 @@ app.include_router(control_router)
 app.include_router(centres_router)
 app.include_router(incidents_router)
 app.include_router(review_router)
+app.include_router(decisions_router)
+app.include_router(status_router)
 
 
 @app.get("/v1/health", status_code=status.HTTP_200_OK)

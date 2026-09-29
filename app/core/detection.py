@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from app.config import get_config
 from app.core.audit_chain import append_audit_entry
 from app.core.impact import compute_incident_impact
+from app.core.notices import emit_notice, format_display_time
 from app.db import format_utc_iso, get_db_connection, resolve_db_path, write_transaction
 
 logger = logging.getLogger("erct.detection")
@@ -352,20 +353,52 @@ class DetectionEngine:
                             conn=conn,
                         )
 
-                        # 5. Insert notices for admin and centre
+                        # 5. Insert notices for candidate, admin and centre
+                        interruption_name = "power" if trigger_type == "power" else "network" if trigger_type == "network" else trigger_type
+                        time_str = format_display_time(window_start, cfg.comms.display_tz)
+
                         cursor.execute(
                             """
-                            INSERT INTO notices (audience, target_id, incident_id, message, created_at)
-                            VALUES ('admin', NULL, ?, ?, ?);
+                            SELECT candidate_id, last_saved_seq
+                            FROM sessions
+                            WHERE centre_id = ? AND state = 'interrupted';
                             """,
-                            (inc_id, f"Incident {inc_id} opened: {trigger_type.upper()} outage detected at centre {cid}.", now_iso),
+                            (cid,),
                         )
-                        cursor.execute(
-                            """
-                            INSERT INTO notices (audience, target_id, incident_id, message, created_at)
-                            VALUES ('centre', ?, ?, ?, ?);
-                            """,
-                            (cid, inc_id, f"Outage detected at centre {cid}. Incident {inc_id} is open.", now_iso),
+                        for s_row in cursor.fetchall():
+                            cand_id = s_row["candidate_id"]
+                            l_seq = s_row["last_saved_seq"] or 0
+                            cand_msg = f"Your exam centre reported a {interruption_name} interruption at {time_str}. Your last confirmed save is #{l_seq}. The exam team is working out the effect on your session. You do not need to do anything."
+                            emit_notice(
+                                conn=conn,
+                                audience="candidate",
+                                target_id=cand_id,
+                                incident_id=inc_id,
+                                kind="incident_opened",
+                                ref_key=f"incident_opened:{inc_id}:{cand_id}",
+                                message=cand_msg,
+                                now_iso=now_iso,
+                            )
+
+                        emit_notice(
+                            conn=conn,
+                            audience="admin",
+                            target_id=None,
+                            incident_id=inc_id,
+                            kind="incident_opened",
+                            ref_key=f"incident_opened:admin:{inc_id}",
+                            message=f"Incident {inc_id} opened: {trigger_type.upper()} outage detected at centre {cid}.",
+                            now_iso=now_iso,
+                        )
+                        emit_notice(
+                            conn=conn,
+                            audience="centre",
+                            target_id=cid,
+                            incident_id=inc_id,
+                            kind="incident_opened",
+                            ref_key=f"incident_opened:centre:{inc_id}:{cid}",
+                            message=f"Outage detected at centre {cid}. Incident {inc_id} is open.",
+                            now_iso=now_iso,
                         )
 
                         tick_summary["incidents_opened"].append(inc_id)
@@ -395,6 +428,26 @@ class DetectionEngine:
                             f"UPDATE sessions SET state = 'interrupted' WHERE session_id IN ({placeholders}) AND state IN ('active', 'resumed');",
                             further_silent_sids,
                         )
+                        cursor.execute(
+                            f"SELECT candidate_id, last_saved_seq FROM sessions WHERE session_id IN ({placeholders});",
+                            further_silent_sids,
+                        )
+                        time_str = format_display_time(window_start, cfg.comms.display_tz)
+                        interruption_name = "power" if inc_type == "power" else "network" if inc_type == "network" else inc_type
+                        for s_row in cursor.fetchall():
+                            cand_id = s_row["candidate_id"]
+                            l_seq = s_row["last_saved_seq"] or 0
+                            cand_msg = f"Your exam centre reported a {interruption_name} interruption at {time_str}. Your last confirmed save is #{l_seq}. The exam team is working out the effect on your session. You do not need to do anything."
+                            emit_notice(
+                                conn=conn,
+                                audience="candidate",
+                                target_id=cand_id,
+                                incident_id=inc_id,
+                                kind="incident_opened",
+                                ref_key=f"incident_opened:{inc_id}:{cand_id}",
+                                message=cand_msg,
+                                now_iso=now_iso,
+                            )
 
                     # Update resumed sessions: sessions with last_heartbeat_at > window_end
                     if window_end:

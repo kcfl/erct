@@ -159,14 +159,25 @@ CREATE TABLE IF NOT EXISTS incident_impacts (
 
 CREATE TABLE IF NOT EXISTS decisions (
     decision_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    incident_id TEXT,
-    candidate_id TEXT,
+    incident_id TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    action TEXT NOT NULL,
     remedy TEXT NOT NULL,
+    extra_seconds INTEGER NOT NULL,
+    rule_id TEXT,
+    recommended_remedy TEXT,
+    impact_version INTEGER DEFAULT 1,
     mode TEXT NOT NULL,
-    decided_by TEXT,
+    decided_by TEXT NOT NULL,
     reason TEXT,
-    created_at TEXT NOT NULL
+    supersedes INTEGER,
+    acknowledged_fairness INTEGER DEFAULT 0,
+    fairness_snapshot TEXT,
+    decided_at TEXT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_decisions_inc_cand_dec
+ON decisions(incident_id, candidate_id, decision_id);
 
 CREATE TABLE IF NOT EXISTS review_queue (
     review_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -189,6 +200,8 @@ CREATE TABLE IF NOT EXISTS notices (
     audience TEXT NOT NULL,
     target_id TEXT,
     incident_id TEXT,
+    kind TEXT,
+    ref_key TEXT,
     message TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
@@ -325,4 +338,39 @@ def init_db(db_path: Optional[str] = None) -> None:
 
         cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_review_queue_inc_cand ON review_queue(incident_id, candidate_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_review_queue_status ON review_queue(status);")
+
+        cursor.execute("PRAGMA table_info(decisions);")
+        dec_cols = {row["name"] for row in cursor.fetchall()}
+        if dec_cols:
+            if "action" not in dec_cols:
+                cursor.execute("ALTER TABLE decisions ADD COLUMN action TEXT;")
+            if "extra_seconds" not in dec_cols:
+                cursor.execute("ALTER TABLE decisions ADD COLUMN extra_seconds INTEGER DEFAULT 0;")
+            if "rule_id" not in dec_cols:
+                cursor.execute("ALTER TABLE decisions ADD COLUMN rule_id TEXT;")
+            if "recommended_remedy" not in dec_cols:
+                cursor.execute("ALTER TABLE decisions ADD COLUMN recommended_remedy TEXT;")
+            if "impact_version" not in dec_cols:
+                cursor.execute("ALTER TABLE decisions ADD COLUMN impact_version INTEGER DEFAULT 1;")
+            if "supersedes" not in dec_cols:
+                cursor.execute("ALTER TABLE decisions ADD COLUMN supersedes INTEGER;")
+            if "acknowledged_fairness" not in dec_cols:
+                cursor.execute("ALTER TABLE decisions ADD COLUMN acknowledged_fairness INTEGER DEFAULT 0;")
+            if "fairness_snapshot" not in dec_cols:
+                cursor.execute("ALTER TABLE decisions ADD COLUMN fairness_snapshot TEXT;")
+            if "decided_at" not in dec_cols:
+                cursor.execute("ALTER TABLE decisions ADD COLUMN decided_at TEXT;")
+
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_decisions_inc_cand_dec ON decisions(incident_id, candidate_id, decision_id);")
+
+        cursor.execute("PRAGMA table_info(notices);")
+        not_cols = {row["name"] for row in cursor.fetchall()}
+        if not_cols:
+            if "kind" not in not_cols:
+                cursor.execute("ALTER TABLE notices ADD COLUMN kind TEXT;")
+            if "ref_key" not in not_cols:
+                cursor.execute("ALTER TABLE notices ADD COLUMN ref_key TEXT;")
+
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_notices_ref_key ON notices(ref_key);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_notices_aud_target ON notices(audience, target_id);")
         cursor.close()

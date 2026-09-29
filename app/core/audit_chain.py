@@ -367,6 +367,7 @@ def get_audit_trail(limit: int = 50, db_path: Optional[str] = None) -> List[Audi
 def main() -> None:
     """CLI utility for verifying and testing the audit chain."""
     parser = argparse.ArgumentParser(description="ERCT Audit Hash Chain CLI")
+    parser.add_argument("--db", type=str, default=None, help="Path to SQLite database")
     parser.add_argument("--verify", action="store_true", help="Verify the integrity of the audit log")
     parser.add_argument("--tamper", type=int, help="[DEMO ONLY] Alter payload of entry at given seq")
     parser.add_argument(
@@ -381,7 +382,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.verify:
-        result = verify_audit_chain()
+        result = verify_audit_chain(db_path=args.db)
         if result.ok:
             print(f"[OK] Audit chain valid. Total entries: {result.total_entries}. Head: {result.head_hash}")
             sys.exit(0)
@@ -390,18 +391,18 @@ def main() -> None:
             sys.exit(1)
 
     elif args.tamper is not None:
-        res = tamper_audit_entry_for_demo(args.tamper)
+        res = tamper_audit_entry_for_demo(args.tamper, db_path=args.db)
         print(f"[DEMO] Tampered entry seq {args.tamper}. Original payload: {res['original_payload']}")
         sys.exit(0)
 
     elif args.restore is not None:
         target_seq = None if args.restore == -1 else args.restore
-        res = restore_audit_entry_for_demo(seq=target_seq)
+        res = restore_audit_entry_for_demo(seq=target_seq, db_path=args.db)
         print(f"[DEMO] Restored entries: {res['restored_seqs']}.")
         sys.exit(0)
 
     else:
-        entries = get_audit_trail(limit=args.inspect)
+        entries = get_audit_trail(limit=args.inspect, db_path=args.db)
         print(f"--- Showing last {len(entries)} audit entries ---")
         for e in reversed(entries):
             print(f"[{e.seq}] {e.ts} | {e.entry_type} | ref:{e.ref_id} | hash:{e.entry_hash[:16]}... | prev:{e.prev_hash[:16]}...")

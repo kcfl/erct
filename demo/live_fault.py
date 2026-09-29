@@ -111,6 +111,7 @@ def run_live_demo(
     interval_s: float = 2.0,
     port: int = 8000,
     no_fault_duration: float = 60.0,
+    controller_flow: bool = False,
 ) -> None:
     print("=" * 78)
     print("ERCT LIVE DEMONSTRATION RUNNER (Phase 3b-i)")
@@ -148,8 +149,21 @@ def run_live_demo(
     api_proc: Optional[subprocess.Popen] = None
     runner: Optional[SimulatorRunner] = None
 
+    mid_cand_statuses: Dict[str, Dict[str, Any]] = {}
+
     def cleanup():
         nonlocal api_proc
+        # Copy to erct.db before cleanup so tamper CLI can inspect it
+        try:
+            import shutil
+            if db_file.exists():
+                shutil.copyfile(str(db_file), "erct.db")
+                Path("data").mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(str(db_file), "data/erct.db")
+                print(f"[DEMO] Preserved demo database to data/erct.db and erct.db for CLI verification/tamper.")
+        except Exception as e:
+            pass
+
         if api_proc is not None:
             print("\n[DEMO] Stopping API server process...")
             api_proc.terminate()
@@ -183,7 +197,8 @@ def run_live_demo(
         # 3. Determine run duration
         if faults:
             max_fault_end = max(f.start_offset_s + f.duration_s for f in faults)
-            buffer_s = 32.0 if any(f.fault_type == "power_loss" for f in faults) else 18.0
+            base_buffer = 45.0 if any(f.fault_type == "power_loss" for f in faults) else 25.0
+            buffer_s = base_buffer + (25.0 if controller_flow else 0.0)
             total_run_s = max_fault_end + buffer_s
         else:
             total_run_s = no_fault_duration
@@ -205,6 +220,7 @@ def run_live_demo(
         runner_thread.start()
 
         start_mono = time.monotonic()
+        incidents_list: List[Dict[str, Any]] = []
 
         # 4. Monitoring loop: inject faults, print mid-outage and post-outage
         while runner_thread.is_alive():
@@ -257,6 +273,18 @@ def run_live_demo(
                     print(f"  Centre Status: {c_status} (expected: down)")
                     print(f"  Session State Breakdown: {st_dict} (expect interrupted)")
 
+                    if controller_flow:
+                        with get_db_connection(str(db_file)) as c_conn:
+                            s_rows = c_conn.execute("SELECT candidate_id FROM sessions WHERE centre_id = ?;", (f.centre_id,)).fetchall()
+                        for s_r in s_rows:
+                            cid = s_r["candidate_id"]
+                            try:
+                                r_st = httpx.get(f"{api_url}/v1/status/{cid}", timeout=2.0)
+                                if r_st.status_code == 200:
+                                    mid_cand_statuses[cid] = r_st.json()
+                            except Exception:
+                                pass
+
                 # Post-outage check (at start + duration + post_offset)
                 post_offset = 15.0 if f.fault_type == "power_loss" else 5.0
                 post_time = f.start_offset_s + f.duration_s + post_offset
@@ -283,35 +311,49 @@ def run_live_demo(
                     print(f"  Centre Status: {c_status} (recovering/ready)")
                     print(f"  Session State Breakdown: {st_dict}")
 
+            # Check if all incidents are resolved with impact computed
+            if faults and all(f.post_printed for f in faults):
+                try:
+                    r_inc = httpx.get(f"{api_url}/v1/incidents", timeout=2.0)
+                    if r_inc.status_code == 200:
+                        inc_data = r_inc.json()
+                        all_res = (
+                            len(inc_data) >= len(faults)
+                            and all(i.get("status") == "resolved" and i.get("impact_computed_at") for i in inc_data)
+                        )
+                        if all_res:
+                            incidents_list = inc_data
+                            print(f"\n[DEMO +{elapsed:.1f}s] All {len(faults)} incidents resolved and impact computed.")
+                            break
+                except Exception:
+                    pass
+
             time.sleep(0.5)
 
-        runner_thread.join(timeout=30.0)
+        # Allow buffer to catch up while runner stays active
+        time.sleep(1.0)
 
-        # Allow final buffer drain and settle
-        print("\n[DEMO] Simulation loop complete. Draining remaining events...")
-        runner.buffer.drain_all(api_base_url=api_url)
-        time.sleep(1.5)
-
-        # Poll until all expected incidents have impact_computed_at
-        expected_inc_count = len(faults)
-        incidents_list: List[Dict[str, Any]] = []
-        for _ in range(30):
-            try:
-                r_inc = httpx.get(f"{api_url}/v1/incidents", timeout=2.0)
-                if r_inc.status_code == 200:
-                    incidents_list = r_inc.json()
-                    all_resolved_and_computed = (
-                        len(incidents_list) >= expected_inc_count
-                        and all(i.get("status") == "resolved" and i.get("impact_computed_at") for i in incidents_list)
-                    )
-                    if all_resolved_and_computed or expected_inc_count == 0:
-                        break
-            except Exception:
-                pass
-            time.sleep(0.5)
+        # If not resolved during loop, poll for final settlement
+        if faults and not incidents_list:
+            expected_inc_count = len(faults)
+            for _ in range(30):
+                try:
+                    r_inc = httpx.get(f"{api_url}/v1/incidents", timeout=2.0)
+                    if r_inc.status_code == 200:
+                        inc_data = r_inc.json()
+                        all_resolved_and_computed = (
+                            len(inc_data) >= expected_inc_count
+                            and all(i.get("status") == "resolved" and i.get("impact_computed_at") for i in inc_data)
+                        )
+                        if all_resolved_and_computed:
+                            incidents_list = inc_data
+                            break
+                except Exception:
+                    pass
+                time.sleep(0.5)
 
         # =======================================================================
-        # VERIFICATION AND REPORTING
+        # VERIFICATION AND REPORTING (Runner still active for healthy telemetry)
         # =======================================================================
         print("\n" + "=" * 78)
         print("ERCT LIVE RUN REPORT & VERIFICATION")
@@ -470,7 +512,183 @@ def run_live_demo(
 
             cursor.close()
 
+        # Clean run verification (No faults)
+        if not faults or len(faults) == 0:
+            with get_db_connection(str(db_file)) as conn:
+                inc_c = conn.execute("SELECT COUNT(*) as c FROM incidents;").fetchone()["c"]
+                dec_c = conn.execute("SELECT COUNT(*) as c FROM decisions;").fetchone()["c"]
+                not_c = conn.execute("SELECT COUNT(*) as c FROM notices;").fetchone()["c"]
+            print("\n" + "=" * 78)
+            print("CLEAN RUN AUDIT & ACTIVITY VERIFICATION (No Faults)")
+            print("=" * 78)
+            print(f"  Total Incidents : {inc_c} (Expected: 0)")
+            print(f"  Total Decisions : {dec_c} (Expected: 0)")
+            print(f"  Total Notices   : {not_c} (Expected: 0)")
+
+        # Controller Workflow (--controller-flow)
+        if controller_flow and incidents_list:
+            print("\n" + "=" * 78)
+            print("CONTROLLER WORKFLOW EXECUTION (--controller-flow)")
+            print("=" * 78)
+
+            # 1. Query Fairness API
+            r_fair = httpx.get(f"{api_url}/v1/fairness?exam_id=EXAM-2026-001", timeout=3.0)
+            fair_data = r_fair.json() if r_fair.status_code == 200 else {}
+            print(f"\n(1) FAIRNESS EVALUATION RESULT")
+            print(f"  Overall Status : {fair_data.get('status')}")
+            print(f"  Flags Raised   : {json.dumps(fair_data.get('flags'), indent=2)}")
+            print("  Centre Statistics:")
+            for cid, stat in fair_data.get("centres", {}).items():
+                m_share = stat.get('share_manual_review', 0.0)
+                e_share = stat.get('share_extra_time', 0.0)
+                c_ratio = stat.get('compensation_ratio')
+                print(f"    {cid}: rows={stat.get('rows')}, manual_review_share={m_share:.1%}, extra_time_share={e_share:.1%}, compensation_ratio={c_ratio}")
+
+            # 2. Iterate through resolved incidents
+            for inc in incidents_list:
+                inc_id = inc["incident_id"]
+                cid = inc["centre_id"]
+                print(f"\n  -------------------------------------------------------------------")
+                print(f"  INCIDENT DECISION CYCLE: {inc_id} ({cid})")
+                print(f"  -------------------------------------------------------------------")
+
+                r_imp = httpx.get(f"{api_url}/v1/incidents/{inc_id}/impact", timeout=3.0)
+                imp_data = r_imp.json() if r_imp.status_code == 200 else {}
+                rows = imp_data.get("rows") or []
+
+                r1_cands = [r["candidate_id"] for r in rows if r["rule_id"] == "R1" or r["remedy_recommended"] == "resume"]
+                r2_cands = [r["candidate_id"] for r in rows if r["rule_id"] == "R2" or r["remedy_recommended"] == "extra_time"]
+                mr_cands = [r["candidate_id"] for r in rows if r["remedy_recommended"] == "manual_review"]
+
+                c_r1 = r1_cands[0] if r1_cands else (rows[0]["candidate_id"] if rows else None)
+                c_r2 = r2_cands[0] if r2_cands else (rows[1]["candidate_id"] if len(rows) > 1 else None)
+                c_mr = mr_cands[0] if mr_cands else None
+
+                tracked = [("R1 (Resume)", c_r1), ("R2 (Extra Time)", c_r2), ("Manual Review", c_mr)]
+
+                print("\n  [MOMENT 1: MID-OUTAGE STATUS]")
+                for label, cand_id in tracked:
+                    if cand_id:
+                        mid_st = mid_cand_statuses.get(cand_id, {})
+                        rem_info = mid_st.get("remedy") or {}
+                        print(f"    {label:<18} [{cand_id}]: state={mid_st.get('session_state')} | remedy_status={rem_info.get('status')} | msg=\"{mid_st.get('latest_message')}\"")
+
+                print("\n  [MOMENT 2: AFTER IMPACT COMPUTATION & BEFORE DECISION]")
+                for label, cand_id in tracked:
+                    if cand_id:
+                        st = httpx.get(f"{api_url}/v1/status/{cand_id}", timeout=2.0).json()
+                        rem_info = st.get("remedy") or {}
+                        print(f"    {label:<18} [{cand_id}]: state={st.get('session_state')} | remedy_status={rem_info.get('status')} | decision={rem_info.get('decision')} | msg=\"{st.get('latest_message')}\"")
+
+                # Approve-All execution
+                ctrl_headers = {"X-Controller-Key": "demo-controller-key"}
+                print("\n  [CONTROLLER ACTION: APPROVE-ALL]")
+                app_res = httpx.post(
+                    f"{api_url}/v1/incidents/{inc_id}/decisions/approve-all",
+                    headers=ctrl_headers,
+                    json={"decided_by": "controller-lead", "acknowledge_fairness": False},
+                    timeout=5.0,
+                )
+                if app_res.status_code == 409:
+                    print(f"    Approve-All Gate: BLOCKED by fairness check (HTTP 409): {app_res.json().get('detail')}")
+                    print("    Retrying Approve-All with acknowledge_fairness=True...")
+                    app_res = httpx.post(
+                        f"{api_url}/v1/incidents/{inc_id}/decisions/approve-all",
+                        headers=ctrl_headers,
+                        json={"decided_by": "controller-lead", "acknowledge_fairness": True},
+                        timeout=5.0,
+                    )
+                    print(f"    Approve-All with Acknowledgement: HTTP {app_res.status_code} => {app_res.json()}")
+                else:
+                    print(f"    Approve-All Gate: ALLOWED (HTTP {app_res.status_code}) => {app_res.json()}")
+
+                # Override manual review row
+                if c_mr:
+                    print("\n  [CONTROLLER ACTION: OVERRIDE ONE MANUAL REVIEW ROW]")
+                    ov_res = httpx.post(
+                        f"{api_url}/v1/decisions",
+                        headers=ctrl_headers,
+                        json={
+                            "incident_id": inc_id,
+                            "candidate_id": c_mr,
+                            "action": "override",
+                            "remedy": "extra_time",
+                            "extra_seconds": 120,
+                            "reason": "Terminal battery degraded faster than expected during power sag",
+                            "decided_by": "controller-lead",
+                        },
+                        timeout=5.0,
+                    )
+                    print(f"    Manual Review Override for {c_mr}: HTTP {ov_res.status_code} => {ov_res.json()}")
+
+                print("\n  [MOMENT 3: AFTER DECISION APPLIED]")
+                for label, cand_id in tracked:
+                    if cand_id:
+                        st = httpx.get(f"{api_url}/v1/status/{cand_id}", timeout=2.0).json()
+                        rem_info = st.get("remedy") or {}
+                        print(f"    {label:<18} [{cand_id}]: state={st.get('session_state')} | remedy_status={rem_info.get('status')} | decision={rem_info.get('decision')} | msg=\"{st.get('latest_message')}\"")
+
+            # Candidate Notices Max Latency
+            with get_db_connection(str(db_file)) as conn:
+                notice_rows = conn.execute(
+                    """
+                    SELECT n.created_at as n_created, i.detected_at as i_detected
+                    FROM notices n
+                    JOIN incidents i ON n.incident_id = i.incident_id
+                    WHERE n.kind = 'incident_opened';
+                    """
+                ).fetchall()
+                latencies = []
+                for nr in notice_rows:
+                    dt_n = parse_iso(nr["n_created"])
+                    dt_i = parse_iso(nr["i_detected"])
+                    latencies.append((dt_n - dt_i).total_seconds())
+
+                max_lat = max(latencies) if latencies else 0.0
+                print(f"\n(3) CANDIDATE NOTICES LATENCY METRIC")
+                print(f"  'incident_opened' Notices Count : {len(latencies)}")
+                print(f"  Max Latency (created_at - detected_at): {max_lat:.3f} s (Target: <= 30.0 s)")
+
+            # Final session states and centre status
+            print(f"\n(4) FINAL SESSION STATES & CENTRE STATUS")
+            for f in faults:
+                with get_db_connection(str(db_file)) as conn:
+                    st_rows = conn.execute(
+                        "SELECT state, count(*) as c FROM sessions WHERE centre_id = ? GROUP BY state;",
+                        (f.centre_id,),
+                    ).fetchall()
+                    st_map = {r["state"]: r["c"] for r in st_rows}
+                r_c = httpx.get(f"{api_url}/v1/centres", timeout=2.0)
+                centres_data = r_c.json() if r_c.status_code == 200 else []
+                c_match = next((c for c in centres_data if c["centre_id"] == f.centre_id), None)
+                c_status = c_match.get("status") if c_match else "unknown"
+                resumed_or_review = st_map.get("resumed", 0) + st_map.get("under_review", 0)
+                print(f"  Centre {f.centre_id}: Status={c_status} (Expected: healthy)")
+                print(f"    Session States: {st_map} (resumed + under_review = {resumed_or_review})")
+
+            # Audit counts by entry_type
+            with get_db_connection(str(db_file)) as conn:
+                audit_type_rows = conn.execute(
+                    "SELECT entry_type, count(*) as c FROM audit_log GROUP BY entry_type ORDER BY entry_type;"
+                ).fetchall()
+                print(f"\n(5) AUDIT COUNTS BY ENTRY_TYPE")
+                for atr in audit_type_rows:
+                    print(f"  {atr['entry_type']:<15}: {atr['c']}")
+                dec_seqs = [r["seq"] for r in conn.execute("SELECT seq FROM audit_log WHERE entry_type = 'decision' ORDER BY seq;").fetchall()]
+                print(f"  Decision Audit Entry Seqs: {dec_seqs[:10]}... (Total {len(dec_seqs)})")
+
+            # Final Audit Chain Verification
+            ver_res = verify_audit_chain(str(db_file))
+            print(f"\n(6) FINAL AUDIT HASH CHAIN VERIFICATION")
+            print(f"  Result : ok={ver_res.ok}, total_entries={ver_res.total_entries}, head={ver_res.head_hash[:16]}...")
+
         print("=" * 78)
+
+        # Stop simulator runner cleanly now that all reports and controller actions are complete
+        if runner:
+            runner.running = False
+        if 'runner_thread' in locals() and runner_thread.is_alive():
+            runner_thread.join(timeout=5.0)
 
     finally:
         cleanup()
@@ -492,6 +710,7 @@ def main():
     parser.add_argument("--duration", type=float, default=60.0)
     parser.add_argument("--interval", type=float, default=2.0)
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--controller-flow", action="store_true", help="Execute decisions, fairness check, and notices flow")
 
     args = parser.parse_args()
 
@@ -518,6 +737,7 @@ def main():
         interval_s=args.interval,
         port=args.port,
         no_fault_duration=no_fault_dur,
+        controller_flow=args.controller_flow,
     )
 
 

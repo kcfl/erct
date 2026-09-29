@@ -764,8 +764,8 @@ class SimulatorRunner:
 
                 self._check_expired_faults()
 
-                # Measure residual pending BEFORE generating new step
-                residual = self.buffer.get_pending_count()
+                # Measure residual pending BEFORE generating new step (exclude paused centres)
+                residual = self.buffer.get_pending_count(exclude_paused=True)
                 if step > 0:
                     self.max_residual_after_step0 = max(self.max_residual_after_step0, residual)
 
