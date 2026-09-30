@@ -146,7 +146,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        worker.running = False
+        worker.stop()
         worker.join(timeout=2.0)
 
 

@@ -539,7 +539,7 @@ def test_06_stragglers(fresh_impact_db: str):
             """,
             (inc_id, ws, ws, we, now_iso),
         )
-        # 10 baseline pre-window heartbeats (no post-window heartbeat yet => missing)
+        # 10 baseline pre-window heartbeats for CAND-000041 (no post-window heartbeat yet => missing)
         for s in range(10):
             t_hb = format_iso(parse_iso(ws) - timedelta(seconds=(9 - s) * 2))
             conn.execute(
@@ -550,14 +550,40 @@ def test_06_stragglers(fresh_impact_db: str):
                 (f"hb-pre-straggler-{s}", s + 1, t_hb, t_hb),
             )
 
-    # Initial impact computation: row has quality 'missing', review queue has 'pending', session has 'under_review'
+        # Baseline heartbeats for CAND-000042: only 2 baseline heartbeats present => partial due to missing slots
+        for s in (0, 1):
+            t_hb = format_iso(parse_iso(ws) - timedelta(seconds=(9 - s) * 2))
+            conn.execute(
+                """
+                INSERT INTO events (event_id, exam_id, centre_id, session_id, candidate_id, seq, ts, type, severity, payload, ingested_at)
+                VALUES (?, 'EX-2026-PS6-01', 'C-BPL-02', 'SES-000042-1', 'CAND-000042', ?, ?, 'HEARTBEAT', 'info', '{"local_seq": 1}', ?);
+                """,
+                (f"hb-pre-straggler42-{s}", s + 1, t_hb, t_hb),
+            )
+        # CAND-000042 has resume heartbeat at window_end => both last_good and resume exist, but evidence is 'partial'
+        t_res42 = format_iso(parse_iso(we) + timedelta(seconds=2))
+        conn.execute(
+            """
+            INSERT INTO events (event_id, exam_id, centre_id, session_id, candidate_id, seq, ts, type, severity, payload, ingested_at)
+            VALUES ('hb-post-straggler42-init', 'EX-2026-PS6-01', 'C-BPL-02', 'SES-000042-1', 'CAND-000042', 3, ?, 'HEARTBEAT', 'info', '{"local_seq": 1}', ?);
+            """,
+            (t_res42, t_res42),
+        )
+
+    # Initial impact computation:
+    # CAND-000041 has quality 'missing', review queue 'pending', session 'under_review'
+    # CAND-000042 has quality 'partial', review queue 'pending', session 'under_review'
     with write_transaction(fresh_impact_db) as conn:
         compute_incident_impact(conn, inc_id, now_iso)
 
     with get_db_connection(fresh_impact_db) as conn:
-        row = conn.execute("SELECT evidence_quality, remedy_recommended FROM incident_impacts WHERE candidate_id = 'CAND-000041';").fetchone()
-        assert row["evidence_quality"] == "missing"
-        assert row["remedy_recommended"] == "manual_review"
+        row41 = conn.execute("SELECT evidence_quality, remedy_recommended FROM incident_impacts WHERE candidate_id = 'CAND-000041';").fetchone()
+        assert row41["evidence_quality"] == "missing"
+        assert row41["remedy_recommended"] == "manual_review"
+
+        row42 = conn.execute("SELECT evidence_quality, remedy_recommended FROM incident_impacts WHERE candidate_id = 'CAND-000042';").fetchone()
+        assert row42["evidence_quality"] == "partial"
+        assert row42["remedy_recommended"] == "manual_review"
 
         rq = conn.execute("SELECT status FROM review_queue WHERE candidate_id = 'CAND-000041';").fetchone()
         assert rq["status"] == "pending"
@@ -565,9 +591,10 @@ def test_06_stragglers(fresh_impact_db: str):
         s_state = conn.execute("SELECT state FROM sessions WHERE candidate_id = 'CAND-000041';").fetchone()["state"]
         assert s_state == "under_review"
 
-    # Straggler resumes! Emits heartbeat post window_end
+    # Stragglers resume and buffered baseline arrives!
     t_resume = format_iso(parse_iso(we) + timedelta(seconds=40))
     with write_transaction(fresh_impact_db) as conn:
+        # CAND-000041 emits resume heartbeat post window_end
         conn.execute(
             """
             INSERT INTO events (event_id, exam_id, centre_id, session_id, candidate_id, seq, ts, type, severity, payload, ingested_at)
@@ -577,15 +604,38 @@ def test_06_stragglers(fresh_impact_db: str):
         )
         conn.execute("UPDATE sessions SET last_heartbeat_at = ? WHERE candidate_id = 'CAND-000041';", (t_resume,))
 
-    # Next tick processes straggler within recompute_window_s
+        # CAND-000042: remaining 8 buffered baseline heartbeats arrive, plus new heartbeat post window_end
+        for s in range(2, 10):
+            t_hb = format_iso(parse_iso(ws) - timedelta(seconds=(9 - s) * 2))
+            conn.execute(
+                """
+                INSERT INTO events (event_id, exam_id, centre_id, session_id, candidate_id, seq, ts, type, severity, payload, ingested_at)
+                VALUES (?, 'EX-2026-PS6-01', 'C-BPL-02', 'SES-000042-1', 'CAND-000042', ?, ?, 'HEARTBEAT', 'info', '{"local_seq": 1}', ?);
+                """,
+                (f"hb-pre-straggler42-late-{s}", s + 10, t_hb, t_resume),
+            )
+        conn.execute(
+            """
+            INSERT INTO events (event_id, exam_id, centre_id, session_id, candidate_id, seq, ts, type, severity, payload, ingested_at)
+            VALUES ('hb-post-straggler42-late', 'EX-2026-PS6-01', 'C-BPL-02', 'SES-000042-1', 'CAND-000042', 25, ?, 'HEARTBEAT', 'info', '{"local_seq": 1}', ?);
+            """,
+            (t_resume, t_resume),
+        )
+        conn.execute("UPDATE sessions SET last_heartbeat_at = ? WHERE candidate_id = 'CAND-000042';", (t_resume,))
+
+    # Next tick processes both missing and partial stragglers within recompute_window_s
     engine = DetectionEngine(fresh_impact_db)
     engine.reset_start_time(parse_iso(now_iso) - timedelta(seconds=120))
     engine.tick(parse_iso(t_resume) + timedelta(seconds=5))
 
     with get_db_connection(fresh_impact_db) as conn:
-        row2 = conn.execute("SELECT evidence_quality, remedy_recommended FROM incident_impacts WHERE candidate_id = 'CAND-000041';").fetchone()
-        assert row2["evidence_quality"] in ("strong", "partial")
-        assert row2["remedy_recommended"] != "manual_review"
+        row41_after = conn.execute("SELECT evidence_quality, remedy_recommended FROM incident_impacts WHERE candidate_id = 'CAND-000041';").fetchone()
+        assert row41_after["evidence_quality"] in ("strong", "partial")
+        assert row41_after["remedy_recommended"] != "manual_review"
+
+        row42_after = conn.execute("SELECT evidence_quality, remedy_recommended FROM incident_impacts WHERE candidate_id = 'CAND-000042';").fetchone()
+        assert row42_after["evidence_quality"] == "strong", f"CAND-000042 must upgrade to strong after baseline arrives, got {row42_after['evidence_quality']}"
+        assert row42_after["remedy_recommended"] != "manual_review"
 
         rq2 = conn.execute("SELECT status FROM review_queue WHERE candidate_id = 'CAND-000041';").fetchone()
         assert rq2["status"] == "superseded", "Review queue entry must be superseded when remedy resolves"

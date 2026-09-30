@@ -937,12 +937,12 @@ class DetectionEngine:
                         SELECT s.last_heartbeat_at
                         FROM incident_impacts ii
                         JOIN sessions s ON ii.candidate_id = s.candidate_id
-                        WHERE ii.incident_id = ? AND ii.evidence_quality = 'missing';
+                        WHERE ii.incident_id = ? AND ii.evidence_quality IN ('missing', 'partial');
                         """,
                         (inc_id,),
                     )
-                    missing_rows = cursor.fetchall()
-                    if missing_rows and any(mr["last_heartbeat_at"] and (we is None or mr["last_heartbeat_at"] > we) for mr in missing_rows):
+                    unresolved_rows = cursor.fetchall()
+                    if unresolved_rows and any(ur["last_heartbeat_at"] and (we is None or ur["last_heartbeat_at"] > we) for ur in unresolved_rows):
                         compute_incident_impact(conn, inc_id, now_iso, cfg)
 
                 cursor.close()
@@ -956,12 +956,17 @@ class DetectionWorker(threading.Thread):
         self.engine = engine
         self.tick_s = tick_s
         self.running = True
+        self._stop_event = threading.Event()
 
     def run(self) -> None:
         logger.info("DetectionWorker started (tick_s=%s)", self.tick_s)
-        while self.running:
+        while self.running and not self._stop_event.is_set():
             try:
                 self.engine.tick(datetime.now(timezone.utc))
             except Exception as e:
                 logger.error("DetectionWorker unhandled tick error (worker will not die): %s", e)
-            time.sleep(self.tick_s)
+            self._stop_event.wait(self.tick_s)
+
+    def stop(self) -> None:
+        self.running = False
+        self._stop_event.set()

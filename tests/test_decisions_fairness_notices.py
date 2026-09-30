@@ -1006,6 +1006,10 @@ def test_12_slow_real_processes(tmp_path: Path):
         if server2 is not None:
             server2.should_exit = True
             server_thread2.join(timeout=3.0)
+        if 'runner' in locals() and runner:
+            runner.stop()
+        if 'sim_thread' in locals() and sim_thread.is_alive():
+            sim_thread.join(timeout=3.0)
         if old_env is not None:
             os.environ["ERCT_CONFIG_PATH"] = old_env
             reload_config(old_env)
@@ -1085,7 +1089,6 @@ def test_13_slow_early_fault_network(tmp_path: Path, interval_s: float):
         )
 
         sim_thread.join(timeout=dur_s + 20.0)
-        runner.buffer.drain_all(api_base_url=base_url)
         time.sleep(2.0)
 
         inc_id = None
@@ -1134,6 +1137,10 @@ def test_13_slow_early_fault_network(tmp_path: Path, interval_s: float):
     finally:
         server.should_exit = True
         server_thread.join(timeout=3.0)
+        if 'runner' in locals() and runner:
+            runner.stop()
+        if 'sim_thread' in locals() and sim_thread.is_alive():
+            sim_thread.join(timeout=3.0)
         if old_env is not None:
             os.environ["ERCT_CONFIG_PATH"] = old_env
             reload_config(old_env)

@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Set
 import httpx
 import yaml
@@ -62,12 +62,12 @@ class CentreAgent:
         self.exam_id = exam_id
         self.seq = 1
 
-    def generate_version_report(self) -> EventEnvelope:
+    def generate_version_report(self, now_iso: Optional[str] = None) -> EventEnvelope:
         cfg = get_config()
         ev = EventEnvelope(
             event_id=str(uuid.uuid4()),
             schema_ver=1,
-            ts=format_utc_iso(datetime.now(timezone.utc)),
+            ts=now_iso or format_utc_iso(datetime.now(timezone.utc)),
             exam_id=self.exam_id,
             centre_id=self.centre_id,
             candidate_id=None,
@@ -83,8 +83,8 @@ class CentreAgent:
         self.seq += 1
         return ev
 
-    def generate_telemetry_samples(self, active_sessions: int, max_sessions: int) -> List[EventEnvelope]:
-        now_iso = format_utc_iso(datetime.now(timezone.utc))
+    def generate_telemetry_samples(self, active_sessions: int, max_sessions: int, now_iso: Optional[str] = None) -> List[EventEnvelope]:
+        now_iso = now_iso or format_utc_iso(datetime.now(timezone.utc))
         events = []
 
         lat_ev = EventEnvelope(
@@ -128,11 +128,11 @@ class CentreAgent:
         events.append(cap_ev)
         return events
 
-    def generate_power_loss(self) -> EventEnvelope:
+    def generate_power_loss(self, now_iso: Optional[str] = None) -> EventEnvelope:
         ev = EventEnvelope(
             event_id=str(uuid.uuid4()),
             schema_ver=1,
-            ts=format_utc_iso(datetime.now(timezone.utc)),
+            ts=now_iso or format_utc_iso(datetime.now(timezone.utc)),
             exam_id=self.exam_id,
             centre_id=self.centre_id,
             candidate_id=None,
@@ -145,11 +145,11 @@ class CentreAgent:
         self.seq += 1
         return ev
 
-    def generate_power_restored(self) -> EventEnvelope:
+    def generate_power_restored(self, now_iso: Optional[str] = None) -> EventEnvelope:
         ev = EventEnvelope(
             event_id=str(uuid.uuid4()),
             schema_ver=1,
-            ts=format_utc_iso(datetime.now(timezone.utc)),
+            ts=now_iso or format_utc_iso(datetime.now(timezone.utc)),
             exam_id=self.exam_id,
             centre_id=self.centre_id,
             candidate_id=None,
@@ -162,11 +162,11 @@ class CentreAgent:
         self.seq += 1
         return ev
 
-    def generate_network_down(self) -> EventEnvelope:
+    def generate_network_down(self, now_iso: Optional[str] = None) -> EventEnvelope:
         ev = EventEnvelope(
             event_id=str(uuid.uuid4()),
             schema_ver=1,
-            ts=format_utc_iso(datetime.now(timezone.utc)),
+            ts=now_iso or format_utc_iso(datetime.now(timezone.utc)),
             exam_id=self.exam_id,
             centre_id=self.centre_id,
             candidate_id=None,
@@ -179,11 +179,11 @@ class CentreAgent:
         self.seq += 1
         return ev
 
-    def generate_network_up(self, duration_s: int) -> EventEnvelope:
+    def generate_network_up(self, duration_s: int, now_iso: Optional[str] = None) -> EventEnvelope:
         ev = EventEnvelope(
             event_id=str(uuid.uuid4()),
             schema_ver=1,
-            ts=format_utc_iso(datetime.now(timezone.utc)),
+            ts=now_iso or format_utc_iso(datetime.now(timezone.utc)),
             exam_id=self.exam_id,
             centre_id=self.centre_id,
             candidate_id=None,
@@ -243,8 +243,8 @@ class CandidateClient:
         self.unsaved_answers_at_start: int = 0
         self.last_saved_seq_at_start: int = 0
 
-    def start_session(self) -> EventEnvelope:
-        now_iso = format_utc_iso(datetime.now(timezone.utc))
+    def start_session(self, now_iso: Optional[str] = None) -> EventEnvelope:
+        now_iso = now_iso or format_utc_iso(datetime.now(timezone.utc))
         ev = EventEnvelope(
             event_id=str(uuid.uuid4()),
             schema_ver=1,
@@ -282,7 +282,7 @@ class CandidateClient:
         self.reboot_ready_mono = now_mono + self.boot_delay_s
         self.restore_start_mono = now_mono
 
-    def tick_heartbeat(self, elapsed_real_s: float, clock_speed: float = 1.0) -> Optional[EventEnvelope]:
+    def tick_heartbeat(self, elapsed_real_s: float, clock_speed: float = 1.0, now_iso: Optional[str] = None) -> Optional[EventEnvelope]:
         now_mono = time.monotonic()
         if self.is_powered_off:
             return None
@@ -298,7 +298,7 @@ class CandidateClient:
                 self.remaining_s = max(0, self.pre_loss_remaining_s - decrement)
                 self.loss_start_mono = None
 
-            now_iso = format_utc_iso(datetime.now(timezone.utc))
+            now_iso = now_iso or format_utc_iso(datetime.now(timezone.utc))
             self.resumed_ts = now_iso
             self.last_good_heartbeat_ts = now_iso
             self.first_hb_mono = now_mono
@@ -331,7 +331,7 @@ class CandidateClient:
         decrement = int(round(elapsed_real_s * clock_speed))
         self.remaining_s = max(0, self.remaining_s - decrement)
 
-        now_iso = format_utc_iso(datetime.now(timezone.utc))
+        now_iso = now_iso or format_utc_iso(datetime.now(timezone.utc))
         ev = EventEnvelope(
             event_id=str(uuid.uuid4()),
             schema_ver=1,
@@ -353,7 +353,7 @@ class CandidateClient:
         self.last_good_heartbeat_ts = now_iso
         return ev
 
-    def advance_answer(self) -> Optional[EventEnvelope]:
+    def advance_answer(self, now_iso: Optional[str] = None) -> Optional[EventEnvelope]:
         """Candidate submits an answer locally, with ~40% chance of triggering immediate server save."""
         if self.is_powered_off or self.booting:
             return None
@@ -362,10 +362,11 @@ class CandidateClient:
         if self.rng.random() < 0.40 or (self.local_seq - self.saved_seq) > 3:
             self.saved_seq = self.local_seq
             ans_hash = hashlib.sha256(f"{self.candidate_id}:Q{self.saved_seq}".encode()).hexdigest()[:16]
+            now_iso = now_iso or format_utc_iso(datetime.now(timezone.utc))
             ev = EventEnvelope(
                 event_id=str(uuid.uuid4()),
                 schema_ver=1,
-                ts=format_utc_iso(datetime.now(timezone.utc)),
+                ts=now_iso,
                 exam_id=self.exam_id,
                 centre_id=self.centre_id,
                 candidate_id=self.candidate_id,
@@ -392,12 +393,13 @@ class SenderThread(threading.Thread):
         self.buffer = buffer
         self.api_base_url = api_base_url
         self.running = True
+        self._stop_event = threading.Event()
         self.total_dispatched = 0
         self.http_client = httpx.Client(timeout=30.0)
 
     def run(self) -> None:
         try:
-            while self.running:
+            while self.running and not self._stop_event.is_set():
                 try:
                     res = self.buffer.drain_once(
                         api_base_url=self.api_base_url,
@@ -409,15 +411,19 @@ class SenderThread(threading.Thread):
 
                     if dispatched == 0:
                         # Buffer empty or all pending items paused/backing off: sleep briefly
-                        time.sleep(0.02)
+                        self._stop_event.wait(0.02)
                 except Exception as e:
                     print(f"[SENDER THREAD ERROR] {type(e).__name__}: {e}")
-                    time.sleep(0.05)
+                    self._stop_event.wait(0.05)
         finally:
             try:
                 self.http_client.close()
             except Exception:
                 pass
+
+    def stop(self) -> None:
+        self.running = False
+        self._stop_event.set()
 
 
 class SimulatorRunner:
@@ -458,10 +464,19 @@ class SimulatorRunner:
         self.peak_backlog: int = 0
         self.peak_backlog_after_step0: int = 0
         self.max_residual_after_step0: int = 0
+        self.start_wall: datetime = datetime.now(timezone.utc)
+        self.start_mono: float = 0.0
 
         self._init_entities()
         self.http_client = httpx.Client(timeout=2.0)
         self.sender = SenderThread(self.buffer, self.api_base_url)
+
+    def stop(self) -> None:
+        """Stop simulator runner and gracefully join sender thread."""
+        self.running = False
+        if hasattr(self, "sender") and self.sender:
+            self.sender.stop()
+            self.sender.join(timeout=2.0)
 
     def _init_entities(self) -> None:
         global_cand_num = 1
@@ -553,9 +568,14 @@ class SimulatorRunner:
 
         print(f"[SIMULATOR] Activated {fault_type} on {centre_id} for {duration_s}s (fault_id: {fault_id})")
 
+        now_mono = time.monotonic()
+        sim_elapsed = now_mono - getattr(self, "start_mono", now_mono)
+        start_wall = getattr(self, "start_wall", datetime.now(timezone.utc))
+        sim_iso = format_utc_iso(start_wall + timedelta(seconds=sim_elapsed))
+
         if fault_type == "power_loss":
             # Edge agent emits last-gasp POWER_LOSS into buffer
-            pl_ev = c_agent.generate_power_loss()
+            pl_ev = c_agent.generate_power_loss(now_iso=sim_iso)
             af.start_ts = pl_ev.ts
             self.buffer.enqueue(pl_ev, centre_id, c_agent.api_key)
             # Power loss wipes unsaved local answers and powers down terminals
@@ -565,7 +585,7 @@ class SimulatorRunner:
         elif fault_type == "network_drop":
             # Edge agent pauses delivery first, then emits NETWORK_DOWN into buffer
             self.buffer.pause_centre(centre_id)
-            nd_ev = c_agent.generate_network_down()
+            nd_ev = c_agent.generate_network_down(now_iso=sim_iso)
             af.start_ts = nd_ev.ts
             self.buffer.enqueue(nd_ev, centre_id, c_agent.api_key)
             for cl in af.candidates_snapshot:
@@ -579,8 +599,13 @@ class SimulatorRunner:
         af.actual_duration_s = actual_dur
         print(f"[SIMULATOR] Restored {af.fault_type} on {centre_id} (actual duration: {actual_dur}s)")
 
+        now_mono = time.monotonic()
+        sim_elapsed = now_mono - getattr(self, "start_mono", now_mono)
+        start_wall = getattr(self, "start_wall", datetime.now(timezone.utc))
+        sim_iso = format_utc_iso(start_wall + timedelta(seconds=sim_elapsed))
+
         if af.fault_type == "power_loss" and c_agent:
-            pr_ev = c_agent.generate_power_restored()
+            pr_ev = c_agent.generate_power_restored(now_iso=sim_iso)
             af.end_ts = pr_ev.ts
             self.buffer.enqueue(pr_ev, centre_id, c_agent.api_key)
 
@@ -597,7 +622,7 @@ class SimulatorRunner:
 
         elif af.fault_type == "network_drop" and c_agent:
             elapsed = int(round(actual_dur))
-            nu_ev = c_agent.generate_network_up(duration_s=elapsed)
+            nu_ev = c_agent.generate_network_up(duration_s=elapsed, now_iso=sim_iso)
             af.end_ts = nu_ev.ts
             self.buffer.enqueue(nu_ev, centre_id, c_agent.api_key)
 
@@ -695,16 +720,17 @@ class SimulatorRunner:
         except Exception as e:
             print(f"[SIMULATOR ERROR] Failed writing ground truth: {e}")
 
-    def generate_step(self, step_idx: int) -> int:
+    def generate_step(self, step_idx: int, step_ts: Optional[str] = None) -> int:
         """Monotonic generation step: generates events and enqueues in buffer in bulk."""
+        step_ts = step_ts or format_utc_iso(datetime.now(timezone.utc))
         events_by_centre: Dict[str, List[EventEnvelope]] = {c.id: [] for c in self.cfg.centres}
 
         # Step 0 initialization
         if step_idx == 0:
             for cid, agent in self.centre_agents.items():
-                events_by_centre[cid].append(agent.generate_version_report())
+                events_by_centre[cid].append(agent.generate_version_report(now_iso=step_ts))
             for client in self.candidate_clients:
-                events_by_centre[client.centre_id].append(client.start_session())
+                events_by_centre[client.centre_id].append(client.start_session(now_iso=step_ts))
 
         # Periodic Centre edge telemetry (every 5 steps)
         if step_idx % 5 == 0:
@@ -715,6 +741,7 @@ class SimulatorRunner:
                     agent.generate_telemetry_samples(
                         active_sessions=self.cfg.simulation.candidates_per_centre,
                         max_sessions=50,
+                        now_iso=step_ts,
                     )
                 )
 
@@ -723,17 +750,17 @@ class SimulatorRunner:
         for client in self.candidate_clients:
             cid = client.centre_id
             if ans_before_hb:
-                ans = client.advance_answer()
+                ans = client.advance_answer(now_iso=step_ts)
                 if ans:
                     events_by_centre[cid].append(ans)
-                hb = client.tick_heartbeat(self.heartbeat_interval_s, clock_speed=self.exam_clock_speed)
+                hb = client.tick_heartbeat(self.heartbeat_interval_s, clock_speed=self.exam_clock_speed, now_iso=step_ts)
                 if hb:
                     events_by_centre[cid].append(hb)
             else:
-                hb = client.tick_heartbeat(self.heartbeat_interval_s, clock_speed=self.exam_clock_speed)
+                hb = client.tick_heartbeat(self.heartbeat_interval_s, clock_speed=self.exam_clock_speed, now_iso=step_ts)
                 if hb:
                     events_by_centre[cid].append(hb)
-                ans = client.advance_answer()
+                ans = client.advance_answer(now_iso=step_ts)
                 if ans:
                     events_by_centre[cid].append(ans)
 
@@ -754,7 +781,9 @@ class SimulatorRunner:
         self.running = True
         self.sender.start()
         step = 0
-        start_mono = time.monotonic()
+        self.start_mono = time.monotonic()
+        self.start_wall = datetime.now(timezone.utc)
+        start_mono = self.start_mono
         last_poll_mono = 0.0
 
         print(f"[SIMULATOR] Decoupled runner started. Heartbeat: {self.heartbeat_interval_s}s, clock_speed: {self.exam_clock_speed}")
@@ -777,7 +806,9 @@ class SimulatorRunner:
                 if step > 0:
                     self.max_residual_after_step0 = max(self.max_residual_after_step0, residual)
 
-                queued = self.generate_step(step)
+                step_dt = self.start_wall + timedelta(seconds=step * self.heartbeat_interval_s)
+                step_ts = format_utc_iso(step_dt)
+                queued = self.generate_step(step, step_ts=step_ts)
                 pending = self.buffer.get_pending_count()
                 self.peak_backlog = max(self.peak_backlog, pending)
                 if step > 0:
@@ -812,7 +843,8 @@ class SimulatorRunner:
                 time.sleep(0.1)
 
             final_pending = self.buffer.get_pending_count()
-            self.sender.running = False
+            self.sender.stop()
+            self.sender.join(timeout=2.0)
             print(f"[SIMULATOR] Done. Dispatched: {self.sender.total_dispatched}, Final pending: {final_pending}, Peak backlog: {self.peak_backlog} (post-step0: {self.peak_backlog_after_step0}), Max residual post-step0: {self.max_residual_after_step0}")
 
 
