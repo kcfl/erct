@@ -186,27 +186,44 @@ First match wins, strictly evaluated in order **R3 -> R4 -> R1 -> R2**:
 ## 16. Evidence Rules As Built
 
 ### 16.1 Designated Pitch Sentence
-> "We don't guess lost time from network silence; we prove it from monotonic sequence gaps and signed local saves, while preserving human-in-the-loop controller sovereignty."
+> "Lost-answer counts are exact only as of the last heartbeat; the error is bounded by one heartbeat interval, and rows with a stale last heartbeat go to human review."
 
 ### 16.2 Stale Factor 1.8 Rationale
-At heartbeat interval $\Delta$, candidate edge telemetry is expected every $\Delta$ wall-clock seconds. If an outage occurs, the last observed heartbeat timestamp `last_good_ts` may precede `window_start`.
+One missed heartbeat makes the last heartbeat about 2.0 intervals old, which must count as stale; 1.8 leaves a margin of 0.2 intervals for jitter.
+
+If an outage occurs, the last observed heartbeat timestamp `last_good_ts` may precede `window_start`.
 - If `stale_seconds = (window_start - last_good_ts) <= 1.8 * interval`, the telemetry at outage inception is verified fresh within one heartbeat interval plus $0.8 \times \Delta$ network jitter tolerance.
 - If `stale_seconds > 1.8 * interval`, telemetry was unobserved during the critical pre-outage window. In this unobserved window, a candidate could have submitted an unconfirmed answer ($L$ incremented in memory) that is wiped upon power cut. Because the server's view of $L$ is frozen in the past, calculating compensation automatically risks under-compensating the candidate.
-- Tightening `stale_hb_factor` from `2.5` to `1.8` correctly classifies unobserved sessions (e.g. CAND-000074 at 0.5s interval with 0.91s staleness) as `partial`, routing them safely to manual review (Rule R3) and guaranteeing 100% calibration and oracle accuracy on all `strong` rows.
+- Tightening `stale_hb_factor` from `2.5` to `1.8` correctly classifies unobserved sessions as `partial`, routing them safely to manual review (Rule R3) and guaranteeing calibration and oracle accuracy on all `strong` rows.
 
 ### 16.3 Telemetry Sequencing: `answer_before_heartbeat`
-Empirical validation of simulator step sequencing under power loss at C-BPL-02 (seed 36):
+Empirical validation of simulator step sequencing under power loss at C-BPL-02:
 
-| Configuration | Evaluated Strong | Calibration Accuracy | Oracle Accuracy | Rationale & Failure Mode |
+| Configuration | Evaluated Strong | Calibration Violations | Oracle Violations | Rationale & Failure Mode |
 |---|---|---|---|---|
-| `answer_before_heartbeat: false` | 36 / 40 | 13 / 36 (36.1%) | 31 / 36 (86.1%) | **Intra-Step Blind Window:** Heartbeat transmitted before answer submission in step $k$. When power cuts before step $k+1$, memory answers are wiped without ever being broadcast to server; server $L$ lags memory by 1. |
-| `answer_before_heartbeat: true` (As Built) | 36 / 40 | 36 / 36 (100.0%) | 36 / 36 (100.0%) | **Committed Telemetry:** Answer submission increments local sequence $L$ before heartbeat dispatch; each heartbeat truthfully advertises latest $L$, ensuring exact server-side recovery calculation. |
+| `answer_before_heartbeat: true` (As Built) | 35 strong | 0 calibration violations | 0 oracle violations | **Committed Telemetry:** Answer submission increments local sequence $L$ before heartbeat dispatch; each heartbeat truthfully advertises latest $L$, ensuring exact server-side recovery calculation. |
+| `answer_before_heartbeat: false` | 36 strong | 23 calibration violations | 5 oracle violations | **Intra-Step Blind Window:** Heartbeat transmitted before answer submission in step $k$. When power cuts before step $k+1$, memory answers are wiped without ever being broadcast to server; server $L$ lags memory by 1. |
 
 ### 16.4 Session `started_at` Lifecycle & Regularity Slot Grid
 1. **Seeding:** All candidate sessions are initialized in SQLite with `started_at = NULL`, `last_heartbeat_at = NULL`, and `state = 'registered'`.
 2. **Ingest Binding:** When the candidate's `SESSION_STARTED` event arrives at ingest, `started_at` is set via `CASE WHEN started_at IS NULL OR ? < started_at THEN ? ELSE started_at END` to the exact event source timestamp `ts`.
 3. **Detection Domain $D$ & Exposed Set:** Sessions with `started_at IS NULL` are unstarted: they are excluded from the active centre detection domain $D$ and excluded from incident exposed sets.
-4. **Regularity Slot Grid:** The baseline slot window evaluates the $K = 10$ slots immediately preceding `window_start` ($[T_{\text{ws}} - K\Delta, T_{\text{ws}}]$). Slots are clipped to `slot_t0 >= started_at`. Because `started_at` is strictly bounded to the candidate's actual start time rather than a synthetic midnight placeholder (`00:00:00`), pre-start intervals are not counted as missing heartbeats.
+4. **Regularity Slot Grid:** The baseline slot window evaluates the $K = 10$ slots immediately preceding `window_start` ($[T_{\text{ws}} - K\Delta, T_{\text{ws}}]$). Slots are clipped to `slot_t0 >= started_at`. Because `started_at` is strictly bounded to the candidate's actual start time rather than a synthetic placeholder, pre-start intervals are not counted as missing heartbeats.
+
+## 17. Simulator Timeline & Jitter Sensitivity
+
+### 17.1 Simulator Timeline (Phase 3b-iii-b2)
+Event timestamps of simulated clients now follow the schedule (`start + step x interval`) instead of the wall clock at creation.
+- **Why:** In-process thread stalls at 0.5 s interval produced an artificial 1.16 s gap followed by clustered heartbeats (evidence: `early_net_5.db` from failing run in prompt 9b-2 STEP 2). The 1.16 s gap spanned two 0.5 s cadence slots, falsely triggering `baseline missing slots > 2 allowed` and downgrading 100% of candidates to manual review.
+- **Correction:** The earlier rule ("ts is always real UTC at creation") is corrected: simulated edge clients stamp events using their deterministic scheduled step timeline (`start_wall + step * interval_s`), preventing Python GIL preemption and OS thread scheduling jitter from injecting artificial clock gaps into baseline regularity checks.
+
+### 17.2 Jitter Sensitivity Analysis
+Evaluation of baseline regularity slot sensitivity under synthetic timing jitter across 40 healthy candidates at 2.0 s interval, 10 baseline slots, fault at 30 s:
+- Jitter +/- 0.25 interval (+/- 0.50 s): 18/40 partial (45.0%)
+- Jitter +/- 0.50 interval (+/- 1.00 s): 18/40 partial (45.0%)
+- Jitter +/- 1.00 interval (+/- 2.00 s): 19/40 partial (47.5%)
+
+Rows that fail this way go to human review, which is the safe direction.
 
 
 

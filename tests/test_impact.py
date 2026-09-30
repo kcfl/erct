@@ -1285,7 +1285,7 @@ def find_free_port() -> int:
 # ---------------------------------------------------------------------------
 # UNIT TEST: Rule R4 Fallback & Weak Evidence Priority
 # ---------------------------------------------------------------------------
-def test_rule_r4_fallback_integrity_flag():
+def test_r3_precedes_r4():
     """Verify behavior when a candidate has fewer than 3 regular heartbeats (<3 slots available)
     and the centre simultaneously has an integrity violation (integrity_flag=True, centre_affected_fraction=1.0).
 
@@ -1327,4 +1327,128 @@ def test_rule_r4_fallback_integrity_flag():
     assert decision.extra_seconds == 0
     assert "Evidence quality is 'partial'" in decision.rationale
     assert "too little history (2 available slots < 3)" in decision.rationale
+
+
+def test_rule_r4_strong_row_with_integrity_flag():
+    """(1) strong row + integrity_flag true + centre_affected_fraction 1.0
+    => rule R4, remedy retest_recommended, extra_seconds 0,
+    and evidence.fallback = {rule_id, remedy, extra_seconds} equal to what
+    evaluate_remedy returns without the flag.
+    """
+    cfg = get_config()
+    facts = create_dummy_facts(lost_s=40.0, lost_answers=1, quality="strong")
+    incident_facts_without = {"centre_affected_fraction": 1.0, "integrity_flag": False}
+    baseline_decision = evaluate_remedy(facts, incident_facts_without, cfg)
+
+    incident_facts_with = {"centre_affected_fraction": 1.0, "integrity_flag": True}
+    r4_decision = evaluate_remedy(facts, incident_facts_with, cfg)
+
+    assert r4_decision.rule_id == "R4"
+    assert r4_decision.remedy == "retest_recommended"
+    assert r4_decision.extra_seconds == 0
+    assert r4_decision.fallback is not None
+    assert r4_decision.fallback["rule_id"] == baseline_decision.rule_id
+    assert r4_decision.fallback["remedy"] == baseline_decision.remedy
+    assert r4_decision.fallback["extra_seconds"] == baseline_decision.extra_seconds
+
+
+def test_rule_r4_not_triggered_below_threshold():
+    """(2) strong row + integrity_flag true + centre_affected_fraction 0.49 => not R4."""
+    cfg = get_config()
+    facts = create_dummy_facts(lost_s=40.0, lost_answers=1, quality="strong")
+    incident_facts = {"centre_affected_fraction": 0.49, "integrity_flag": True}
+    decision = evaluate_remedy(facts, incident_facts, cfg)
+
+    assert decision.rule_id != "R4"
+    assert decision.rule_id == "R1"
+    assert decision.remedy == "resume"
+
+
+def test_jitter_sensitivity():
+    """JITTER SENSITIVITY: 40 healthy candidates at interval 2.0s with seeded uniform
+    timing jitter of +/-0.25, +/-0.5, and +/-1.0 interval, baseline 10 slots, fault at 30s.
+    Prints per jitter level the share of healthy candidates classified partial.
+    """
+    import random
+    cfg = get_config()
+    interval_s = cfg.impact.heartbeat_interval_s  # 2.0
+    fault_offset_s = 30.0
+    num_candidates = 40
+
+    t0 = datetime(2026, 9, 30, 10, 0, 0, tzinfo=timezone.utc)
+    ws_dt = t0 + timedelta(seconds=fault_offset_s)
+    we_dt = ws_dt + timedelta(seconds=30.0)
+    ws_iso = ws_dt.isoformat()
+    we_iso = we_dt.isoformat()
+
+    jitter_levels = [0.25, 0.50, 1.00]
+    results = {}
+
+    for jitter_mult in jitter_levels:
+        random.seed(42)
+        partial_count = 0
+
+        for cand_idx in range(1, num_candidates + 1):
+            cand_id = f"CAND-{cand_idx:06d}"
+            sess_id = f"SES-{cand_idx:06d}-1"
+
+            hbs = []
+            step = 0
+            while True:
+                nom_s = step * interval_s
+                if nom_s > fault_offset_s:
+                    break
+                jitter = random.uniform(-jitter_mult * interval_s, jitter_mult * interval_s)
+                hb_time = t0 + timedelta(seconds=max(0.0, nom_s + jitter))
+                hbs.append({
+                    "event_id": f"hb-{cand_idx}-{step}",
+                    "seq": step + 1,
+                    "ts": hb_time.isoformat(),
+                    "ts_dt": hb_time,
+                    "type": "HEARTBEAT",
+                    "payload": {"local_seq": step + 1, "remaining_s": 7200},
+                })
+                step += 1
+
+            hbs.sort(key=lambda x: x["ts_dt"])
+            for idx, h in enumerate(hbs, 1):
+                h["seq"] = idx
+                h["payload"]["local_seq"] = idx
+
+            session = {
+                "session_id": sess_id,
+                "candidate_id": cand_id,
+                "centre_id": "C-BPL-01",
+                "started_at": t0.isoformat(),
+                "state": "active",
+            }
+
+            post_resume_hb = {
+                "event_id": f"hb-{cand_idx}-resume",
+                "seq": len(hbs) + 1,
+                "ts": (we_dt + timedelta(seconds=2.0)).isoformat(),
+                "ts_dt": we_dt + timedelta(seconds=2.0),
+                "type": "HEARTBEAT",
+                "payload": {"local_seq": len(hbs) + 1, "remaining_s": 7200},
+            }
+            cand_events = hbs + [post_resume_hb]
+
+            facts = compute_session_facts(
+                events=cand_events,
+                session=session,
+                window_start=ws_iso,
+                window_end=we_iso,
+                cfg=cfg,
+            )
+
+            if facts.evidence_quality == "partial":
+                partial_count += 1
+
+        share_partial = partial_count / num_candidates
+        results[jitter_mult] = (partial_count, share_partial)
+        print(f"[JITTER SENSITIVITY] +/- {jitter_mult:.2f} interval: {partial_count}/{num_candidates} partial ({share_partial:.1%})")
+
+    assert results[0.25][0] > 0
+    assert results[0.50][0] > 0
+    assert results[1.00][0] > 0
 

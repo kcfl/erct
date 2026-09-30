@@ -440,6 +440,37 @@ def run_live_demo(
             print(f"    Centre Affected Fraction : {summary.get('centre_affected_fraction')}")
             print(f"    Centre Retest Recommended: {summary.get('centre_retest_recommended')}")
 
+            # Calculate reason breakdown
+            reasons_count: Dict[str, int] = {}
+            for r in rows:
+                ev_str = r.get("evidence")
+                if ev_str:
+                    try:
+                        ev_dict = json.loads(ev_str) if isinstance(ev_str, str) else ev_str
+                        r_reas = ev_dict.get("reason")
+                        if r_reas:
+                            reasons_count[r_reas] = reasons_count.get(r_reas, 0) + 1
+                    except Exception:
+                        pass
+
+            late_count = 0
+            if db_file.exists():
+                try:
+                    with get_db_connection(str(db_file)) as conn:
+                        we = inc.get("window_end")
+                        if we:
+                            row_l = conn.execute(
+                                "SELECT COUNT(*) FROM events WHERE centre_id = ? AND ts <= ? AND ingested_at > ?;",
+                                (cid, we, we)
+                            ).fetchone()
+                            if row_l:
+                                late_count = row_l[0]
+                except Exception:
+                    pass
+
+            print(f"    Reason Breakdown         : {reasons_count if reasons_count else {'clean': len(rows)}}")
+            print(f"    Late Events Count        : {late_count}")
+
             # (2.b) Distribution of (window_start - last_good_ts) across candidates
             stale_vals = []
             for r in rows:
@@ -598,13 +629,14 @@ def run_live_demo(
             print("=" * 78)
 
             # 1. Query Fairness API
-            r_fair = httpx.get(f"{api_url}/v1/fairness?exam_id=EXAM-2026-001", timeout=3.0)
+            r_fair = httpx.get(f"{api_url}/v1/fairness", timeout=3.0)
             fair_data = r_fair.json() if r_fair.status_code == 200 else {}
             print(f"\n(1) FAIRNESS EVALUATION RESULT")
             print(f"  Overall Status : {fair_data.get('status')}")
             print(f"  Flags Raised   : {json.dumps(fair_data.get('flags'), indent=2)}")
             print("  Centre Statistics:")
-            for cid, stat in fair_data.get("centres", {}).items():
+            c_stats = fair_data.get("stats_per_centre") or fair_data.get("centres") or {}
+            for cid, stat in c_stats.items():
                 m_share = stat.get('share_manual_review', 0.0)
                 e_share = stat.get('share_extra_time', 0.0)
                 c_ratio = stat.get('compensation_ratio')
