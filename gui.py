@@ -1896,13 +1896,14 @@ class FaultPanel(tk.Frame):
 class FloorCanvas(tk.Frame):
     """Floor view displaying labs, machines, and live operational topology."""
 
-    def __init__(self, parent: tk.Widget, on_inject: Optional[Any] = None):
+    def __init__(self, parent: tk.Widget, on_inject: Optional[Any] = None, on_double_click: Optional[Any] = None):
         super().__init__(parent, bg=COLOR_PANEL, highlightthickness=1, highlightbackground=COLOR_BORDER)
         self.canvas = tk.Canvas(self, bg=COLOR_PANEL, highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
 
         self.scene = FacilityScene(self.canvas)
         self._resize_after_id: Optional[str] = None
+        self._on_double_click_cb = on_double_click
 
         # Floating Toast and FaultPanel anchored on FloorCanvas
         self.toast = ToastNotification(self)
@@ -1912,6 +1913,7 @@ class FloorCanvas(tk.Frame):
         self.canvas.bind("<Configure>", self._on_configure)
         self.canvas.bind("<Motion>", self.scene.on_mouse_move)
         self.canvas.bind("<Button-1>", self.scene.on_mouse_click)
+        self.canvas.bind("<Double-Button-1>", self._on_double_click)
         self.canvas.bind("<Leave>", self.scene.on_mouse_leave)
 
     def _on_configure(self, _event: tk.Event) -> None:
@@ -1932,6 +1934,19 @@ class FloorCanvas(tk.Frame):
 
     def show_toast(self, text: str, is_error: bool = False) -> None:
         self.toast.show(text, is_error=is_error)
+
+    def _on_double_click(self, event: tk.Event) -> None:
+        """Double-click a workstation: select it and switch to Candidate tab."""
+        mx, my = event.x, event.y
+        for (cid, pc_idx), pc in self.scene.pcs.items():
+            bx0, by0, bx1, by1 = pc["bbox"]
+            if bx0 <= mx <= bx1 and by0 <= my <= by1:
+                # Select the workstation (same as single click)
+                self.scene.on_mouse_click(event)
+                # Trigger callback to switch to Candidate tab
+                if self._on_double_click_cb:
+                    self._on_double_click_cb(pc["candidate_id"])
+                return
 
     def update_view(self, state: AppState) -> None:
         """Bind state updates into scene and fault panel."""
@@ -2954,6 +2969,467 @@ class ImpactTab(tk.Frame):
 # ---------------------------------------------------------------------------
 # NOTEBOOK PANEL (RIGHT 30%)
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# CANDIDATE STATUS TAB
+# ---------------------------------------------------------------------------
+class CandidateTab(tk.Frame):
+    """Phone-style candidate status card with live polling."""
+
+    POLL_MS = 2000  # 2 second refresh
+
+    def __init__(self, parent: tk.Widget, app: Any):
+        super().__init__(parent, bg=COLOR_PANEL)
+        self.app = app
+        self._current_cand: Optional[str] = None
+        self._poll_after_id: Optional[str] = None
+        self._last_status: Optional[Dict[str, Any]] = None
+        self._last_notices: Optional[List[Dict[str, Any]]] = None
+        self._widgets_built = False
+
+        # --- Top lookup bar ---
+        lookup_bar = tk.Frame(self, bg=COLOR_PANEL, pady=6, padx=8)
+        lookup_bar.pack(fill=tk.X)
+        tk.Label(lookup_bar, text="Candidate:", font=FONT_UI_SMALL, fg=COLOR_MUTED, bg=COLOR_PANEL).pack(side=tk.LEFT)
+        self.lookup_var = tk.StringVar()
+        self.lookup_entry = tk.Entry(
+            lookup_bar, textvariable=self.lookup_var, font=FONT_MONO_SMALL,
+            bg=COLOR_CARD, fg=COLOR_TEXT, insertbackground=COLOR_TEAL,
+            borderwidth=1, relief="solid", width=18,
+        )
+        self.lookup_entry.pack(side=tk.LEFT, padx=(4, 4))
+        self.lookup_entry.bind("<Return>", self._on_lookup)
+        self.lookup_btn = tk.Button(
+            lookup_bar, text="Look up", font=FONT_UI_SMALL,
+            bg=COLOR_CARD, fg=COLOR_TEXT, activebackground=COLOR_BORDER,
+            activeforeground=COLOR_TEAL, borderwidth=1, relief="solid",
+            command=self._on_lookup,
+        )
+        self.lookup_btn.pack(side=tk.LEFT)
+        self.error_lbl = tk.Label(lookup_bar, text="", font=FONT_UI_SMALL, fg=COLOR_RED, bg=COLOR_PANEL)
+        self.error_lbl.pack(side=tk.LEFT, padx=(8, 0))
+
+        # --- Scrollable card area ---
+        self.card_scroll = ScrollableFrame(self, bg=COLOR_PANEL)
+        self.card_scroll.pack(fill=tk.BOTH, expand=True)
+        self.card_container = self.card_scroll.inner
+
+        # --- Build persistent card widgets (hidden until data arrives) ---
+        self._build_card_widgets()
+
+    # -----------------------------------------------------------------------
+    # WIDGET CONSTRUCTION (once)
+    # -----------------------------------------------------------------------
+    def _build_card_widgets(self) -> None:
+        """Create all card widgets once; update text in place on refresh."""
+        c = self.card_container
+
+        # Outer card frame (phone-style, ~340px, centred)
+        self.card_outer = tk.Frame(c, bg=COLOR_PANEL)
+        self.card_outer.pack(fill=tk.X, pady=(8, 4), padx=8)
+
+        # Teal top border bar
+        self.teal_bar = tk.Frame(self.card_outer, bg=COLOR_TEAL, height=3)
+        self.teal_bar.pack(fill=tk.X)
+
+        # Dark card body
+        self.card_body = tk.Frame(self.card_outer, bg=COLOR_CARD, padx=14, pady=10,
+                                  highlightthickness=1, highlightbackground=COLOR_BORDER)
+        self.card_body.pack(fill=tk.X)
+
+        # Title line
+        self.lbl_title = tk.Label(self.card_body, text="Candidate status", font=FONT_UI_BOLD,
+                                   fg=COLOR_TEAL, bg=COLOR_CARD, anchor="w")
+        self.lbl_title.pack(fill=tk.X)
+
+        self.lbl_ids = tk.Label(self.card_body, text="", font=FONT_MONO_SMALL,
+                                 fg=COLOR_MUTED, bg=COLOR_CARD, anchor="w")
+        self.lbl_ids.pack(fill=tk.X, pady=(0, 6))
+
+        # Big headline
+        self.lbl_headline = tk.Label(self.card_body, text="", font=("Segoe UI", 11),
+                                      fg=COLOR_TEXT, bg=COLOR_CARD, anchor="w",
+                                      wraplength=310, justify="left")
+        self.lbl_headline.pack(fill=tk.X, pady=(0, 10))
+
+        # Vertical timeline container
+        self.timeline_frame = tk.Frame(self.card_body, bg=COLOR_CARD)
+        self.timeline_frame.pack(fill=tk.X, pady=(0, 8))
+
+        # We build 3 timeline steps: Incident detected, Centre recovered, Remedy decided
+        self.tl_steps: List[Dict[str, Any]] = []
+        tl_labels = ["Incident detected", "Centre recovered", "Remedy decided"]
+        for idx, label in enumerate(tl_labels):
+            row_frame = tk.Frame(self.timeline_frame, bg=COLOR_CARD)
+            row_frame.pack(fill=tk.X, pady=1)
+
+            # Dot canvas (small, for a filled/hollow dot)
+            dot_cvs = tk.Canvas(row_frame, width=16, height=16, bg=COLOR_CARD, highlightthickness=0)
+            dot_cvs.pack(side=tk.LEFT, padx=(0, 4))
+            dot_id = dot_cvs.create_oval(4, 4, 12, 12, fill=COLOR_BORDER, outline=COLOR_MUTED, width=1)
+
+            # Connecting line below (except last)
+            line_cvs = None
+            if idx < len(tl_labels) - 1:
+                line_cvs = tk.Canvas(self.timeline_frame, width=16, height=10, bg=COLOR_CARD, highlightthickness=0)
+                line_cvs.pack(fill=tk.X, before=None)
+                line_cvs.create_line(8, 0, 8, 10, fill=COLOR_BORDER, width=1, dash=(2, 2))
+
+            lbl = tk.Label(row_frame, text=label, font=FONT_UI_SMALL, fg=COLOR_MUTED, bg=COLOR_CARD, anchor="w")
+            lbl.pack(side=tk.LEFT, padx=(0, 6))
+
+            time_lbl = tk.Label(row_frame, text="", font=FONT_MONO_TINY, fg=COLOR_MUTED, bg=COLOR_CARD, anchor="w")
+            time_lbl.pack(side=tk.LEFT)
+
+            self.tl_steps.append({
+                "dot_cvs": dot_cvs,
+                "dot_id": dot_id,
+                "label": lbl,
+                "time_lbl": time_lbl,
+                "line_cvs": line_cvs,
+            })
+
+        # Separator
+        tk.Frame(self.card_body, bg=COLOR_BORDER, height=1).pack(fill=tk.X, pady=(4, 6))
+
+        # Notices header
+        self.lbl_notices_hdr = tk.Label(self.card_body, text="Notices", font=FONT_UI_BOLD,
+                                         fg=COLOR_MUTED, bg=COLOR_CARD, anchor="w")
+        self.lbl_notices_hdr.pack(fill=tk.X)
+
+        # Notices text (scrollable, read-only)
+        self.notices_text = tk.Text(
+            self.card_body, height=5, font=FONT_MONO_TINY, bg="#0b1426", fg=COLOR_TEXT,
+            wrap="word", borderwidth=1, relief="solid", highlightthickness=0,
+            insertbackground=COLOR_TEAL, state="disabled",
+        )
+        self.notices_text.pack(fill=tk.X, pady=(2, 6))
+
+        # Separator
+        tk.Frame(self.card_body, bg=COLOR_BORDER, height=1).pack(fill=tk.X, pady=(0, 6))
+
+        # Raw fields block (Consolas, muted)
+        self.lbl_raw_hdr = tk.Label(self.card_body, text="Raw session fields", font=FONT_UI_TINY_BOLD,
+                                     fg=COLOR_MUTED, bg=COLOR_CARD, anchor="w")
+        self.lbl_raw_hdr.pack(fill=tk.X)
+
+        self.raw_text = tk.Text(
+            self.card_body, height=4, font=FONT_MONO_TINY, bg="#0b1426", fg=COLOR_MUTED,
+            wrap="word", borderwidth=1, relief="solid", highlightthickness=0,
+            insertbackground=COLOR_TEAL, state="disabled",
+        )
+        self.raw_text.pack(fill=tk.X, pady=(2, 6))
+
+        # Privacy footer
+        self.lbl_footer = tk.Label(self.card_body, text="Pseudonymous id only. No personal data is stored.",
+                                    font=FONT_UI_TINY, fg=COLOR_MUTED, bg=COLOR_CARD, anchor="w")
+        self.lbl_footer.pack(fill=tk.X, pady=(2, 0))
+
+        # Initially hidden until a candidate is selected
+        self.card_outer.pack_forget()
+
+        # Empty state label
+        self.lbl_empty = tk.Label(
+            c, text="Select a workstation or look up a candidate ID above.",
+            font=FONT_UI, fg=COLOR_MUTED, bg=COLOR_PANEL,
+        )
+        self.lbl_empty.pack(expand=True)
+
+        self._widgets_built = True
+
+    # -----------------------------------------------------------------------
+    # LOOKUP
+    # -----------------------------------------------------------------------
+    def _on_lookup(self, _event=None) -> None:
+        raw = self.lookup_var.get().strip()
+        if not raw:
+            return
+        self.error_lbl.config(text="")
+        if self.app:
+            self.app.state.selected_candidate = raw
+            self.app.floor_view.update_view(self.app.state)
+        self._set_candidate(raw)
+
+    # -----------------------------------------------------------------------
+    # CANDIDATE CHANGE
+    # -----------------------------------------------------------------------
+    def _set_candidate(self, cand_id: Optional[str]) -> None:
+        if cand_id == self._current_cand:
+            return
+        self._current_cand = cand_id
+        self._last_status = None
+        self._last_notices = None
+        self.error_lbl.config(text="")
+
+        if not cand_id:
+            self.card_outer.pack_forget()
+            self.lbl_empty.pack(expand=True)
+            self._cancel_poll()
+            return
+
+        # Show card, hide empty
+        try:
+            self.lbl_empty.pack_forget()
+        except Exception:
+            pass
+        self.card_outer.pack(fill=tk.X, pady=(8, 4), padx=8)
+
+        # Clear stale text
+        self.lbl_ids.config(text=cand_id)
+        self.lbl_headline.config(text="Loading...")
+        for step in self.tl_steps:
+            step["time_lbl"].config(text="")
+            step["dot_cvs"].itemconfig(step["dot_id"], fill=COLOR_BORDER, outline=COLOR_MUTED)
+        self.notices_text.config(state="normal")
+        self.notices_text.delete("1.0", tk.END)
+        self.notices_text.config(state="disabled")
+        self.raw_text.config(state="normal")
+        self.raw_text.delete("1.0", tk.END)
+        self.raw_text.config(state="disabled")
+
+        # Trigger immediate fetch
+        self._do_poll()
+
+    # -----------------------------------------------------------------------
+    # POLLING
+    # -----------------------------------------------------------------------
+    def _cancel_poll(self) -> None:
+        if self._poll_after_id:
+            try:
+                self.after_cancel(self._poll_after_id)
+            except Exception:
+                pass
+            self._poll_after_id = None
+
+    def _schedule_poll(self) -> None:
+        self._cancel_poll()
+        self._poll_after_id = self.after(self.POLL_MS, self._do_poll)
+
+    def _do_poll(self) -> None:
+        cand_id = self._current_cand
+        if not cand_id or not self.app:
+            return
+        api = self.app.api_client
+
+        def _bg():
+            try:
+                status = api.get(f"/v1/status/{cand_id}")
+                notices = api.get(f"/v1/notices?audience=candidate&target_id={cand_id}")
+                self.app.queue.put(("candidate_status", {"cand_id": cand_id, "status": status, "notices": notices}, time.time()))
+            except ApiException as ae:
+                self.app.queue.put(("candidate_status", {"cand_id": cand_id, "error": ae.detail}, time.time()))
+            except Exception as ex:
+                log_ascii(f"CandidateTab poll error for {cand_id}", ex)
+                # Keep last good data; schedule next poll
+                self.app.queue.put(("candidate_status", {"cand_id": cand_id, "poll_error": True}, time.time()))
+
+        threading.Thread(target=_bg, daemon=True, name="CandStatusPoll").start()
+
+    def _handle_poll_result(self, data: Dict[str, Any]) -> None:
+        """Called on the main thread from _drain_queue_loop."""
+        cand_id = data.get("cand_id")
+        if cand_id != self._current_cand:
+            return  # Stale response from a previous candidate
+
+        error = data.get("error")
+        if error:
+            self.error_lbl.config(text=error)
+            self.card_outer.pack_forget()
+            try:
+                self.lbl_empty.pack_forget()
+            except Exception:
+                pass
+            self.lbl_empty.config(text=error)
+            self.lbl_empty.pack(expand=True)
+            # Don't schedule more polls for a 404
+            return
+
+        if data.get("poll_error"):
+            # Keep last good card, just schedule next poll
+            self._schedule_poll()
+            return
+
+        status = data.get("status", {})
+        notices = data.get("notices", [])
+        self._last_status = status
+        self._last_notices = notices
+        self._render_card(status, notices)
+        self._schedule_poll()
+
+    # -----------------------------------------------------------------------
+    # RENDERING (update in place)
+    # -----------------------------------------------------------------------
+    def _render_card(self, status: Dict[str, Any], notices: List[Dict[str, Any]]) -> None:
+        cand_id = status.get("candidate_id", "")
+        centre_id = status.get("centre_id", "")
+        session_state = status.get("session_state", "")
+        incident = status.get("incident")
+        remedy = status.get("remedy", {})
+        remedy_status = remedy.get("status", "none")
+        decision = remedy.get("decision")
+        latest_message = status.get("latest_message", "")
+
+        # --- IDs line ---
+        self.lbl_ids.config(text=f"{cand_id}  |  {centre_id}")
+
+        # --- Headline ---
+        headline = self._build_headline(incident, remedy_status, decision, latest_message)
+        self.lbl_headline.config(text=headline)
+
+        # --- Timeline ---
+        self._render_timeline(incident, decision, status)
+
+        # --- Notices ---
+        self._render_notices(notices)
+
+        # --- Raw fields ---
+        self._render_raw(status)
+
+    def _build_headline(self, incident: Optional[Dict], remedy_status: str,
+                        decision: Optional[Dict], latest_message: str) -> str:
+        """Choose headline from real API fields. Use latest_message from the API when available,
+        fall back to structured headlines."""
+        if not incident:
+            # Use the API's latest_message if it's meaningful
+            if latest_message:
+                return latest_message
+            return "Your exam is running normally"
+
+        inc_status = incident.get("status", "")
+
+        if remedy_status == "decided" and decision:
+            remedy_name = decision.get("remedy", "")
+            extra_s = decision.get("extra_seconds") or 0
+            if remedy_name == "resume":
+                return "Your remedy: resume with restored time"
+            elif remedy_name == "extra_time":
+                mins = extra_s // 60
+                secs = extra_s % 60
+                if secs > 0:
+                    return f"Your remedy: extra time of {mins} minutes and {secs} seconds"
+                return f"Your remedy: extra time of {mins} minutes"
+            elif remedy_name == "retest":
+                return "Your remedy: retest scheduled"
+            elif remedy_name == "no_compensation":
+                return "Your remedy: no compensation required"
+            else:
+                return f"Your remedy: {remedy_name}"
+
+        if remedy_status == "under_review":
+            return "Your case is being reviewed by the exam controller"
+
+        if remedy_status == "awaiting_decision":
+            if latest_message:
+                return latest_message
+            return "Your exam was interrupted. Your remedy is being determined."
+
+        if inc_status in ("open", "recovering"):
+            if latest_message:
+                return latest_message
+            return "Your exam was interrupted. Please wait for instructions."
+
+        # Resolved but no impact computed yet
+        if latest_message:
+            return latest_message
+        return "Your exam was interrupted. The exam team is investigating."
+
+    def _render_timeline(self, incident: Optional[Dict], decision: Optional[Dict],
+                         status: Dict[str, Any]) -> None:
+        """Update timeline dots and time labels."""
+        # Step 0: Incident detected
+        if incident:
+            started = incident.get("started_at", "")
+            ts_str = self._fmt_time(started)
+            self.tl_steps[0]["time_lbl"].config(text=ts_str, fg=COLOR_TEXT)
+            self.tl_steps[0]["dot_cvs"].itemconfig(self.tl_steps[0]["dot_id"],
+                                                    fill=COLOR_TEAL, outline=COLOR_TEAL)
+
+            # Step 1: Centre recovered
+            ended = incident.get("ended_at", "")
+            inc_status = incident.get("status", "")
+            if ended and inc_status == "resolved":
+                ts_str2 = self._fmt_time(ended)
+                self.tl_steps[1]["time_lbl"].config(text=ts_str2, fg=COLOR_TEXT)
+                self.tl_steps[1]["dot_cvs"].itemconfig(self.tl_steps[1]["dot_id"],
+                                                        fill=COLOR_TEAL, outline=COLOR_TEAL)
+            else:
+                self.tl_steps[1]["time_lbl"].config(text="pending", fg=COLOR_MUTED)
+                self.tl_steps[1]["dot_cvs"].itemconfig(self.tl_steps[1]["dot_id"],
+                                                        fill="", outline=COLOR_MUTED)
+
+            # Step 2: Remedy decided
+            remedy = status.get("remedy", {})
+            if remedy.get("status") == "decided" and decision:
+                self.tl_steps[2]["time_lbl"].config(text="decided", fg=COLOR_TEXT)
+                self.tl_steps[2]["dot_cvs"].itemconfig(self.tl_steps[2]["dot_id"],
+                                                        fill=COLOR_TEAL, outline=COLOR_TEAL)
+            elif remedy.get("status") == "under_review":
+                self.tl_steps[2]["time_lbl"].config(text="under review", fg=COLOR_AMBER)
+                self.tl_steps[2]["dot_cvs"].itemconfig(self.tl_steps[2]["dot_id"],
+                                                        fill="", outline=COLOR_AMBER)
+            else:
+                self.tl_steps[2]["time_lbl"].config(text="pending", fg=COLOR_MUTED)
+                self.tl_steps[2]["dot_cvs"].itemconfig(self.tl_steps[2]["dot_id"],
+                                                        fill="", outline=COLOR_MUTED)
+        else:
+            # No incident: all grey/hidden
+            for step in self.tl_steps:
+                step["time_lbl"].config(text="", fg=COLOR_MUTED)
+                step["dot_cvs"].itemconfig(step["dot_id"], fill=COLOR_BORDER, outline=COLOR_MUTED)
+
+    def _render_notices(self, notices: List[Dict[str, Any]]) -> None:
+        # Newest first
+        sorted_notices = sorted(notices, key=lambda n: n.get("notice_id", 0), reverse=True)
+        lines = []
+        for n in sorted_notices:
+            ts = self._fmt_time(n.get("created_at", ""))
+            msg = n.get("message", "")
+            lines.append(f"[{ts}] {msg}")
+        content = "\n".join(lines) if lines else "No notices"
+        self.notices_text.config(state="normal")
+        self.notices_text.delete("1.0", tk.END)
+        self.notices_text.insert("1.0", content)
+        self.notices_text.config(state="disabled")
+
+    def _render_raw(self, status: Dict[str, Any]) -> None:
+        fields = [
+            f"session_id      : {status.get('session_id', '-')}",
+            f"session_state   : {status.get('session_state', '-')}",
+            f"last_save_seq   : {status.get('last_confirmed_save_seq', 0)}",
+            f"remedy_status   : {status.get('remedy', {}).get('status', 'none')}",
+            f"generated_at    : {self._fmt_time(status.get('generated_at', ''))}",
+        ]
+        content = "\n".join(fields)
+        self.raw_text.config(state="normal")
+        self.raw_text.delete("1.0", tk.END)
+        self.raw_text.insert("1.0", content)
+        self.raw_text.config(state="disabled")
+
+    @staticmethod
+    def _fmt_time(iso_str: str) -> str:
+        if not iso_str:
+            return ""
+        try:
+            dt = datetime.fromisoformat(iso_str)
+            return dt.strftime("%H:%M:%S")
+        except Exception:
+            return iso_str[:19]
+
+    # -----------------------------------------------------------------------
+    # PUBLIC: called from update_view
+    # -----------------------------------------------------------------------
+    def update_view(self, state: AppState) -> None:
+        cand = state.selected_candidate
+        if cand != self._current_cand:
+            self.error_lbl.config(text="")
+            self._set_candidate(cand)
+            if cand:
+                self.lookup_var.set(cand)
+        # Only actively poll when the Candidate tab is visible
+        if state.selected_tab != "Candidate":
+            self._cancel_poll()
+
+
 class NotebookPanel(tk.Frame):
     """Right tabbed inspection panel: Incidents, Impact, Audit, Candidate."""
 
@@ -2983,17 +3459,9 @@ class NotebookPanel(tk.Frame):
         )
         lbl_audit.pack(expand=True)
 
-        # Tab 4: Candidate (Placeholder for next stage)
-        self.candidate_frame = tk.Frame(self.notebook, bg=COLOR_PANEL, padx=16, pady=16)
-        self.notebook.add(self.candidate_frame, text="Candidate")
-        lbl_cand = tk.Label(
-            self.candidate_frame,
-            text="Candidate panel coming soon...",
-            font=FONT_UI,
-            fg=COLOR_MUTED,
-            bg=COLOR_PANEL,
-        )
-        lbl_cand.pack(expand=True)
+        # Tab 4: Candidate Status Tab
+        self.candidate_tab = CandidateTab(self.notebook, app=self.app)
+        self.notebook.add(self.candidate_tab, text="Candidate")
 
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
@@ -3005,9 +3473,17 @@ class NotebookPanel(tk.Frame):
             if tab_names[sel_idx] == "Impact" and self.app.state.selected_incident:
                 self.app.trigger_impact_refresh(self.app.state.selected_incident)
 
+    def select_candidate_tab(self) -> None:
+        """Programmatically switch to the Candidate tab."""
+        try:
+            self.notebook.select(self.candidate_tab)
+        except Exception:
+            pass
+
     def update_view(self, state: AppState) -> None:
         self.incidents_tab.update_view(state)
         self.impact_tab.update_view(state)
+        self.candidate_tab.update_view(state)
 
 
 # ---------------------------------------------------------------------------
@@ -3201,12 +3677,18 @@ class ControlTowerApp:
         self.main_container.grid_rowconfigure(0, weight=1)
 
         # Left Floor Canvas (70%)
-        self.floor_view = FloorCanvas(self.main_container, on_inject=self.inject_fault)
+        self.floor_view = FloorCanvas(self.main_container, on_inject=self.inject_fault,
+                                       on_double_click=self._on_workstation_double_click)
         self.floor_view.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
 
         # Right Notebook (30%)
         self.notebook_panel = NotebookPanel(self.main_container, app=self)
         self.notebook_panel.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+
+    def _on_workstation_double_click(self, candidate_id: str) -> None:
+        """Handle double-click on a workstation: select candidate and switch to Candidate tab."""
+        self.state.selected_candidate = candidate_id
+        self.notebook_panel.select_candidate_tab()
 
     def trigger_impact_refresh(self, incident_id: str) -> None:
         """Trigger an immediate asynchronous poll of incident impact."""
@@ -3266,6 +3748,9 @@ class ControlTowerApp:
                                 except Exception:
                                     pass
                             self.floor_view.show_toast(err_msg, is_error=True)
+                elif name == "candidate_status":
+                    if isinstance(data_or_err, dict):
+                        self.notebook_panel.candidate_tab._handle_poll_result(data_or_err)
                 else:
                     self.state.handle_poll_result(name, data_or_err, ts)
 
