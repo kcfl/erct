@@ -10,6 +10,7 @@ import json
 import os
 import queue
 import random
+import sys
 import threading
 import time
 import traceback
@@ -56,11 +57,11 @@ class ApiException(Exception):
 
 
 class ApiClient:
-    """Wraps httpx.Client with base URL from env ERCT_API, timeout 4.0s (configurable via env ERCT_TIMEOUT)."""
+    """Wraps httpx.Client with base URL from env ERCT_API, default timeout 2.0s (configurable via env ERCT_TIMEOUT)."""
 
     def __init__(self, base_url: Optional[str] = None, timeout: Optional[float] = None):
         self.base_url = (base_url or os.environ.get("ERCT_API", "http://127.0.0.1:8000")).rstrip("/")
-        t_val = timeout if timeout is not None else float(os.environ.get("ERCT_TIMEOUT", "4.0"))
+        t_val = timeout if timeout is not None else float(os.environ.get("ERCT_TIMEOUT", "2.0"))
         self.client = httpx.Client(base_url=self.base_url, timeout=t_val)
 
     def _handle_response(self, response: httpx.Response) -> Any:
@@ -79,14 +80,20 @@ class ApiClient:
             raise ApiException(response.status_code, detail)
         return response.json()
 
-    def get(self, path: str) -> Any:
+    def get(self, path: str, timeout: Optional[float] = None) -> Any:
         url = path if path.startswith("/") else f"/{path}"
-        resp = self.client.get(url)
+        if timeout is not None:
+            resp = self.client.get(url, timeout=timeout)
+        else:
+            resp = self.client.get(url)
         return self._handle_response(resp)
 
-    def post(self, path: str, json: Any = None, headers: Optional[Dict[str, str]] = None) -> Any:
+    def post(self, path: str, json: Any = None, headers: Optional[Dict[str, str]] = None, timeout: Optional[float] = None) -> Any:
         url = path if path.startswith("/") else f"/{path}"
-        resp = self.client.post(url, json=json, headers=headers)
+        if timeout is not None:
+            resp = self.client.post(url, json=json, headers=headers, timeout=timeout)
+        else:
+            resp = self.client.post(url, json=json, headers=headers)
         return self._handle_response(resp)
 
     def close(self) -> None:
@@ -112,6 +119,7 @@ class AppState:
         # Per-centre sessions list: centre_id -> List[session_dict]
         self.centre_sessions: Dict[str, List[Dict[str, Any]]] = {}
 
+        self.liveness_consecutive_failures: int = 0
         self.api_ok: bool = False
         self.api_status: str = "DOWN"
         self.last_successful_poll_ts: float = 0.0
@@ -133,22 +141,17 @@ class AppState:
 
     def handle_poll_result(self, name: str, data_or_error: Any, ts: float) -> None:
         """Process incoming poll data or record an error."""
-        if isinstance(data_or_error, Exception):
-            self.last_error = str(data_or_error)
-            if self.last_successful_poll_ts == 0.0 or (time.time() - self.last_successful_poll_ts > 4.0):
-                self.api_ok = False
-                self.api_status = "DOWN"
-            return
-
-        data = data_or_error
-        self.api_ok = True
-        self.last_successful_poll_ts = ts
-        self.last_error = None
-
         if name == "health":
+            if isinstance(data_or_error, Exception):
+                log_ascii("Health poll error/timeout (retaining last audit values)", data_or_error)
+                # Slow health response must not change API pill or reset audit status
+                return
+
+            data = data_or_error
             self.health = data
             raw_status = str(data.get("status", "healthy")).upper()
-            self.api_status = raw_status if raw_status in ("HEALTHY", "DEGRADED") else "HEALTHY"
+            if self.api_ok:
+                self.api_status = raw_status if raw_status in ("HEALTHY", "DEGRADED") else "HEALTHY"
             curr_events = data.get("events_count", 0)
             if self.last_events_ts > 0 and ts > self.last_events_ts:
                 dt = ts - self.last_events_ts
@@ -160,12 +163,39 @@ class AppState:
             self.last_events_ts = ts
             self.audit_ok = bool(data.get("audit_chain_ok", True))
             self.audit_total_entries = data.get("total_audit_entries", 0)
+            return
 
         elif name == "centres":
-            if isinstance(data, list):
-                self.centres = data
+            if isinstance(data_or_error, Exception):
+                self.liveness_consecutive_failures += 1
+                self.last_error = str(data_or_error)
+                log_ascii(f"Liveness failure #{self.liveness_consecutive_failures} on /v1/centres", data_or_error)
+                if self.liveness_consecutive_failures >= 2:
+                    self.api_ok = False
+                    self.api_status = "DOWN"
+                return
 
-        elif name == "centre_sessions":
+            self.liveness_consecutive_failures = 0
+            self.api_ok = True
+            if self.api_status == "DOWN":
+                self.api_status = "HEALTHY"
+            self.last_successful_poll_ts = ts
+            self.last_error = None
+            if isinstance(data_or_error, list):
+                self.centres = data_or_error
+            return
+
+        # Other poll results
+        if isinstance(data_or_error, Exception):
+            self.last_error = str(data_or_error)
+            log_ascii(f"Poll error on {name}", data_or_error)
+            return
+
+        data = data_or_error
+        self.last_successful_poll_ts = ts
+        self.last_error = None
+
+        if name == "centre_sessions":
             if isinstance(data, dict):
                 cid = data.get("centre_id")
                 sessions = data.get("sessions")
@@ -222,9 +252,14 @@ class Poller(threading.Thread):
         self.last_sessions_poll = 0.0
         self.last_impact_poll = 0.0
 
+        # Dedicated non-overlapping /v1/health call: 8s timeout, every 3s
+        self.health_interval = 3.0
+        self.health_timeout = 8.0
+        self.last_health_poll = 0.0
+        self._health_in_flight = False
+
         # Endpoint configurations: (name, path, interval_seconds)
         self.endpoints: List[Tuple[str, str, float]] = [
-            ("health", "/v1/health", 2.0),
             ("centres", "/v1/centres", 1.0),
             ("incidents", "/v1/incidents", 1.0),
             ("readiness", "/v1/readiness", 30.0),
@@ -237,7 +272,24 @@ class Poller(threading.Thread):
         while not self.stop_event.is_set():
             now = time.time()
 
-            # 1. Main endpoints
+            # Dedicated non-overlapping /v1/health call with 8s timeout every 3s
+            if not self.stop_event.is_set() and (now - self.last_health_poll >= self.health_interval):
+                if not self._health_in_flight:
+                    self.last_health_poll = now
+                    self._health_in_flight = True
+
+                    def _poll_health():
+                        try:
+                            data = self.client.get("/v1/health", timeout=self.health_timeout)
+                            self.queue.put(("health", data, time.time()))
+                        except Exception as err:
+                            self.queue.put(("health", err, time.time()))
+                        finally:
+                            self._health_in_flight = False
+
+                    threading.Thread(target=_poll_health, daemon=True, name="HealthPollWorker").start()
+
+            # 1. Main endpoints (keep default 2.0s timeout)
             for name, path, interval in self.endpoints:
                 if self.stop_event.is_set():
                     break
@@ -298,15 +350,39 @@ COLOR_AMBER = "#fbbf24"
 COLOR_RED = "#f87171"
 COLOR_BLUE = "#60a5fa"
 
-FONT_UI = ("Segoe UI", 10)
-FONT_UI_BOLD = ("Segoe UI", 10, "bold")
-FONT_UI_SMALL = ("Segoe UI", 9)
-FONT_UI_TINY = ("Segoe UI", 8)
-FONT_UI_TINY_BOLD = ("Segoe UI", 8, "bold")
-FONT_UI_HEADING = ("Segoe UI", 12, "bold")
-FONT_MONO = ("Consolas", 10)
-FONT_MONO_SMALL = ("Consolas", 9)
-FONT_MONO_TINY = ("Consolas", 8)
+# Command-line scaling support: python gui.py --scale 1.25
+SCALE: float = 1.0
+import sys
+for arg in sys.argv:
+    if arg.startswith("--scale="):
+        try:
+            SCALE = float(arg.split("=")[1])
+        except ValueError:
+            pass
+if "--scale" in sys.argv:
+    try:
+        idx = sys.argv.index("--scale")
+        if idx + 1 < len(sys.argv):
+            SCALE = float(sys.argv[idx + 1])
+    except ValueError:
+        pass
+
+
+def sc(val: int | float) -> int:
+    """Scale a numeric pixel coordinate, font size or dimension by global SCALE factor."""
+    return max(1, int(round(val * SCALE)))
+
+
+FONT_UI = ("Segoe UI", sc(10))
+FONT_UI_BOLD = ("Segoe UI", sc(10), "bold")
+FONT_UI_SMALL = ("Segoe UI", sc(9))
+FONT_UI_TINY = ("Segoe UI", sc(8))
+FONT_UI_TINY_BOLD = ("Segoe UI", sc(8), "bold")
+FONT_UI_HEADING = ("Segoe UI", sc(12), "bold")
+FONT_CAPTION = ("Segoe UI", sc(20))
+FONT_MONO = ("Consolas", sc(10))
+FONT_MONO_SMALL = ("Consolas", sc(9))
+FONT_MONO_TINY = ("Consolas", sc(8))
 
 
 def apply_dark_theme(style: ttk.Style) -> None:
@@ -476,8 +552,9 @@ class ChevronStrip(tk.Canvas):
 class TopBar(tk.Frame):
     """Top bar containing brand title, chevron ribbon, and telemetry status pills."""
 
-    def __init__(self, parent: tk.Widget):
+    def __init__(self, parent: tk.Widget, app: Optional[Any] = None):
         super().__init__(parent, bg=COLOR_BG, height=48, pady=6, padx=12)
+        self.app = app
         self.pack_propagate(False)
 
         # 1. Left Title
@@ -491,6 +568,24 @@ class TopBar(tk.Frame):
             bg=COLOR_BG,
         )
         self.title_label.pack(anchor="w")
+
+        # Mode Toggle (Free / Guided) - default Free
+        self.mode_var = "Free"
+        self.btn_mode = tk.Button(
+            self,
+            text="Mode: Free",
+            font=FONT_UI_SMALL,
+            bg=COLOR_CARD,
+            fg=COLOR_MUTED,
+            activebackground=COLOR_BORDER,
+            activeforeground=COLOR_TEAL,
+            relief="solid",
+            borderwidth=1,
+            padx=10,
+            pady=2,
+            command=self._on_toggle_mode,
+        )
+        self.btn_mode.pack(side=tk.LEFT, padx=(12, 8))
 
         # 2. Middle Chevron
         self.chevron = ChevronStrip(self, width=440, height=30)
@@ -556,6 +651,17 @@ class TopBar(tk.Frame):
             borderwidth=1,
         )
         self.api_pill.pack(side=tk.RIGHT, padx=4)
+
+    def _on_toggle_mode(self) -> None:
+        if self.app and hasattr(self.app, "toggle_guided_mode"):
+            self.app.toggle_guided_mode()
+
+    def set_mode(self, mode: str) -> None:
+        self.mode_var = mode
+        if mode == "Guided":
+            self.btn_mode.config(text="Mode: Guided", fg=COLOR_TEAL, bg="#133038")
+        else:
+            self.btn_mode.config(text="Mode: Free", fg=COLOR_MUTED, bg=COLOR_CARD)
 
     def update_view(self, state: AppState) -> None:
         """Reflect latest state on all pills."""
@@ -1034,7 +1140,7 @@ class FacilityScene:
             # Highlight matching lab
             h_id = items.get("highlight_poly")
             if h_id:
-                if cid == selected_cid:
+                if cid == selected_cid or cid == getattr(self, "highlighted_centre", None):
                     self.canvas.itemconfig(h_id, state="normal")
                     self.canvas.tag_raise(h_id)
                 else:
@@ -1860,7 +1966,29 @@ class FaultPanel(tk.Frame):
                         except Exception:
                             pass
 
+    def set_guided_mode(self, is_guided: bool) -> None:
+        self.is_guided = is_guided
+        if is_guided:
+            self.inject_btn.config(state="disabled", bg="#1e293b", fg="#64748b", cursor="arrow")
+            self.centre_combo.config(state="disabled")
+            self.fault_combo.config(state="disabled")
+            if hasattr(self, "dur_spin"):
+                self.dur_spin.config(state="disabled")
+            self.reason_label.config(text="Guided mode: manual fault injection disabled", fg=COLOR_MUTED)
+        else:
+            self.centre_combo.config(state="readonly")
+            self.fault_combo.config(state="readonly")
+            if hasattr(self, "dur_spin"):
+                self.dur_spin.config(state="normal")
+            self.reason_label.config(text="")
+
     def update_state(self, state: AppState) -> None:
+        if getattr(self, "is_guided", False):
+            self.inject_btn.config(state="disabled", bg="#1e293b", fg="#64748b", cursor="arrow")
+            self.reason_label.config(text="Guided mode: manual fault injection disabled", fg=COLOR_MUTED)
+            self.update_stopwatch(state)
+            return
+
         # Update centre combobox values from API
         if state.centres:
             cids = [c["centre_id"] for c in state.centres if "centre_id" in c]
@@ -1891,6 +2019,144 @@ class FaultPanel(tk.Frame):
 
 
 # ---------------------------------------------------------------------------
+# GUIDED DEMO CONTROL BAR
+# ---------------------------------------------------------------------------
+class GuidedControlBar(tk.Frame):
+    """Floating bottom-centre control bar for Guided Demo Mode."""
+
+    def __init__(self, parent: tk.Widget, manager: Optional[Any] = None):
+        super().__init__(
+            parent,
+            bg="#0e172a",
+            highlightthickness=2,
+            highlightbackground=COLOR_TEAL,
+            padx=sc(16),
+            pady=sc(10),
+        )
+        self.manager = manager
+
+        # Row 1: Step title + status badge
+        row1 = tk.Frame(self, bg="#0e172a")
+        row1.pack(fill=tk.X)
+
+        self.lbl_step = tk.Label(
+            row1,
+            text="Step 1 of 7",
+            font=FONT_UI_BOLD,
+            fg=COLOR_TEAL,
+            bg="#0e172a",
+        )
+        self.lbl_step.pack(side=tk.LEFT)
+
+        self.lbl_badge = tk.Label(
+            row1,
+            text="[READY]",
+            font=FONT_MONO_TINY,
+            fg=COLOR_GREEN,
+            bg="#0d2b20",
+            padx=6,
+            pady=1,
+            relief="solid",
+            borderwidth=1,
+        )
+        self.lbl_badge.pack(side=tk.LEFT, padx=10)
+
+        # Row 2: 20 pt Segoe UI plain-language caption (no emoji)
+        self.lbl_caption = tk.Label(
+            self,
+            text="All five exam centres are live and heartbeat monitoring is active.",
+            font=FONT_CAPTION,
+            fg=COLOR_TEXT,
+            bg="#0e172a",
+            wraplength=sc(700),
+            justify="center",
+            pady=sc(6),
+        )
+        self.lbl_caption.pack(fill=tk.X)
+
+        # Row 3: Sub-status line (progress, timer, counts)
+        self.lbl_substatus = tk.Label(
+            self,
+            text="",
+            font=FONT_UI_SMALL,
+            fg=COLOR_AMBER,
+            bg="#0e172a",
+        )
+        self.lbl_substatus.pack(fill=tk.X, pady=(0, sc(4)))
+
+        # Row 4: Action buttons
+        row4 = tk.Frame(self, bg="#0e172a")
+        row4.pack(fill=tk.X, pady=(sc(4), 0))
+
+        self.btn_reset = tk.Button(
+            row4,
+            text="Reset demo",
+            font=FONT_UI_SMALL,
+            bg=COLOR_CARD,
+            fg=COLOR_MUTED,
+            activebackground=COLOR_BORDER,
+            activeforeground=COLOR_TEXT,
+            relief="solid",
+            borderwidth=1,
+            padx=12,
+            pady=4,
+            command=self._on_reset,
+        )
+        self.btn_reset.pack(side=tk.LEFT)
+
+        self.btn_retry = tk.Button(
+            row4,
+            text="Retry",
+            font=FONT_UI_BOLD,
+            bg="#361010",
+            fg=COLOR_RED,
+            activebackground=COLOR_BORDER,
+            activeforeground=COLOR_RED,
+            relief="solid",
+            borderwidth=1,
+            padx=12,
+            pady=4,
+            command=self._on_retry,
+        )
+        self.btn_retry.pack(side=tk.LEFT, padx=(10, 0))
+        self.btn_retry.pack_forget()
+
+        self.btn_next = tk.Button(
+            row4,
+            text="NEXT STEP",
+            font=FONT_UI_HEADING,
+            bg=COLOR_TEAL,
+            fg="#0b1426",
+            activebackground="#34d399",
+            activeforeground="#0b1426",
+            relief="solid",
+            borderwidth=1,
+            padx=20,
+            pady=5,
+            cursor="hand2",
+            command=self._on_next,
+        )
+        self.btn_next.pack(side=tk.RIGHT)
+
+    def set_manager(self, manager: Any) -> None:
+        self.manager = manager
+        if manager and hasattr(manager, "set_bar"):
+            manager.set_bar(self)
+
+    def _on_next(self) -> None:
+        if self.manager:
+            self.manager.on_next_step()
+
+    def _on_reset(self) -> None:
+        if self.manager:
+            self.manager.on_reset_clicked()
+
+    def _on_retry(self) -> None:
+        if self.manager:
+            self.manager.on_retry_clicked()
+
+
+# ---------------------------------------------------------------------------
 # FLOOR CANVAS (LEFT 70% CONTAINER)
 # ---------------------------------------------------------------------------
 class FloorCanvas(tk.Frame):
@@ -1910,6 +2176,9 @@ class FloorCanvas(tk.Frame):
         self.fault_panel = FaultPanel(self, on_inject_cb=on_inject)
         self.fault_panel.place(relx=0.0, rely=1.0, x=10, y=-10, anchor="sw")
 
+        # Floating GuidedControlBar anchored bottom-center
+        self.guided_bar = GuidedControlBar(self)
+
         self.canvas.bind("<Configure>", self._on_configure)
         self.canvas.bind("<Motion>", self.scene.on_mouse_move)
         self.canvas.bind("<Button-1>", self.scene.on_mouse_click)
@@ -1928,6 +2197,7 @@ class FloorCanvas(tk.Frame):
         h = max(520, self.canvas.winfo_height())
         self.scene.build_scene(w, h)
         self.fault_panel.lift()
+        self.guided_bar.lift()
         self.toast.lift()
         if self.scene.state:
             self.scene.update_data(self.scene.state)
@@ -3430,6 +3700,581 @@ class CandidateTab(tk.Frame):
             self._cancel_poll()
 
 
+# ---------------------------------------------------------------------------
+# AUDIT TAB
+# ---------------------------------------------------------------------------
+class AuditTab(tk.Frame):
+    """Cryptographic audit chain visualizer with live strip, sweep animation, and demo controls."""
+
+    POLL_MS = 3000
+    NUM_BLOCKS = 8
+    BLOCK_W = 115
+    BLOCK_H = 135
+    BLOCK_GAP = 28
+    PAD_X = 16
+    PAD_Y = 12
+
+    TYPE_COLORS = {
+        "event": COLOR_TEAL,
+        "incident": COLOR_RED,
+        "impact": COLOR_BLUE,
+        "decision": COLOR_GREEN,
+        "notice": COLOR_AMBER,
+        "config": "#94a3b8",
+    }
+
+    def __init__(self, parent: tk.Widget, app: Any = None):
+        super().__init__(parent, bg=COLOR_PANEL)
+        self.app = app
+        self._mode = "LIVE"
+        self._pinned_seq: Optional[int] = None
+        self._poll_after_id: Optional[str] = None
+        self._visible_entries: List[Dict[str, Any]] = []
+        self._blocks: List[Dict[str, Any]] = []
+        self._is_verifying = False
+        self._is_failed = False
+        self._is_verified = False
+        self._full_head_hash = ""
+        self._user_has_typed_tamper = False
+
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        # 1. Top bar: title + mode badge + toggle + chain info
+        top_bar = tk.Frame(self, bg=COLOR_PANEL, pady=6, padx=12)
+        top_bar.pack(fill=tk.X)
+
+        tk.Label(top_bar, text="Cryptographic Audit Chain", font=FONT_UI_BOLD, fg=COLOR_TEAL, bg=COLOR_PANEL).pack(side=tk.LEFT)
+
+        self.lbl_mode = tk.Label(top_bar, text="[LIVE]", font=FONT_MONO_TINY, fg=COLOR_GREEN, bg="#0d2b20", padx=6, pady=2)
+        self.lbl_mode.pack(side=tk.LEFT, padx=(10, 6))
+
+        self.btn_mode_toggle = tk.Button(
+            top_bar, text="Pin", font=FONT_UI_SMALL,
+            bg=COLOR_CARD, fg=COLOR_TEXT, activebackground=COLOR_BORDER,
+            activeforeground=COLOR_TEAL, borderwidth=1, relief="solid",
+            command=self._toggle_mode,
+        )
+        self.btn_mode_toggle.pack(side=tk.LEFT)
+
+        self.lbl_chain_head = tk.Label(top_bar, text="", font=FONT_MONO_TINY, fg=COLOR_MUTED, bg=COLOR_PANEL)
+        self.lbl_chain_head.pack(side=tk.RIGHT)
+
+        # 2. Canvas strip with horizontal scrollbar
+        strip_frame = tk.Frame(self, bg=COLOR_PANEL, padx=8, pady=4)
+        strip_frame.pack(fill=tk.X)
+
+        total_w = self.PAD_X * 2 + self.NUM_BLOCKS * self.BLOCK_W + (self.NUM_BLOCKS - 1) * self.BLOCK_GAP
+        canvas_h = self.BLOCK_H + self.PAD_Y * 2
+
+        self.canvas = tk.Canvas(
+            strip_frame, bg=COLOR_PANEL, height=canvas_h,
+            highlightthickness=0, borderwidth=0,
+        )
+        self.canvas.pack(fill=tk.X, expand=True)
+
+        h_scroll = ttk.Scrollbar(strip_frame, orient="horizontal", command=self.canvas.xview)
+        h_scroll.pack(fill=tk.X, pady=(2, 0))
+        self.canvas.configure(xscrollcommand=h_scroll.set, scrollregion=(0, 0, total_w, canvas_h))
+
+        # Build 8 persistent block structures on canvas
+        self._blocks = []
+        for i in range(self.NUM_BLOCKS):
+            x0 = self.PAD_X + i * (self.BLOCK_W + self.BLOCK_GAP)
+            x1 = x0 + self.BLOCK_W
+            y0 = self.PAD_Y
+            y1 = y0 + self.BLOCK_H
+
+            card_id = self.canvas.create_rectangle(x0, y0, x1, y1, fill=COLOR_CARD, outline=COLOR_BORDER, width=2)
+            type_bg_id = self.canvas.create_rectangle(x0 + 6, y0 + 6, x1 - 6, y0 + 24, fill="#1c2d52", outline="", width=0)
+            type_text_id = self.canvas.create_text((x0 + x1) / 2, y0 + 15, text="", font=FONT_MONO_TINY, fill=COLOR_TEAL)
+            seq_text_id = self.canvas.create_text((x0 + x1) / 2, y0 + 38, text="", font=FONT_UI_BOLD, fill=COLOR_TEXT)
+            ref_text_id = self.canvas.create_text((x0 + x1) / 2, y0 + 58, text="", font=FONT_MONO_TINY, fill=COLOR_MUTED)
+            hash_text_id = self.canvas.create_text((x0 + x1) / 2, y0 + 76, text="", font=FONT_MONO_TINY, fill=COLOR_MUTED)
+            prev_text_id = self.canvas.create_text((x0 + x1) / 2, y0 + 94, text="", font=FONT_MONO_TINY, fill=COLOR_MUTED)
+
+            crack_id = self.canvas.create_line(
+                x0 + 12, y0 + 12,
+                x0 + 45, y0 + 52,
+                x0 + 32, y0 + 82,
+                x1 - 12, y1 - 12,
+                fill=COLOR_RED, width=2.5, state="hidden"
+            )
+            status_id = self.canvas.create_text((x0 + x1) / 2, y0 + 118, text="", font=FONT_UI_TINY_BOLD, fill=COLOR_AMBER)
+
+            arrow_id = None
+            if i < self.NUM_BLOCKS - 1:
+                arrow_x0 = x1 + 4
+                arrow_x1 = x1 + self.BLOCK_GAP - 4
+                arrow_y = y0 + self.BLOCK_H / 2
+                arrow_id = self.canvas.create_line(
+                    arrow_x0, arrow_y, arrow_x1, arrow_y,
+                    arrow=tk.LAST, fill=COLOR_BORDER, width=2, arrowshape=(8, 10, 4)
+                )
+
+            self._blocks.append({
+                "card_id": card_id,
+                "type_bg_id": type_bg_id,
+                "type_text_id": type_text_id,
+                "seq_text_id": seq_text_id,
+                "ref_text_id": ref_text_id,
+                "hash_text_id": hash_text_id,
+                "prev_text_id": prev_text_id,
+                "crack_id": crack_id,
+                "status_id": status_id,
+                "arrow_id": arrow_id,
+            })
+
+        # 3. Verification result card
+        verify_card = tk.Frame(self, bg=COLOR_CARD, padx=12, pady=10, highlightthickness=1, highlightbackground=COLOR_BORDER)
+        verify_card.pack(fill=tk.X, padx=12, pady=(6, 4))
+
+        row1 = tk.Frame(verify_card, bg=COLOR_CARD)
+        row1.pack(fill=tk.X)
+
+        self.btn_verify = tk.Button(
+            row1, text="Verify Chain", font=FONT_UI_BOLD,
+            bg=COLOR_PANEL, fg=COLOR_TEAL, activebackground=COLOR_BORDER,
+            activeforeground=COLOR_TEAL, borderwidth=1, relief="solid", padx=10, pady=2,
+            command=self._on_verify,
+        )
+        self.btn_verify.pack(side=tk.LEFT)
+
+        self.lbl_verify_status = tk.Label(
+            row1, text="Press Verify to audit hash chain", font=FONT_UI_BOLD,
+            fg=COLOR_MUTED, bg=COLOR_CARD,
+        )
+        self.lbl_verify_status.pack(side=tk.LEFT, padx=(12, 6))
+
+        self.lbl_verify_time = tk.Label(
+            row1, text="", font=FONT_MONO_SMALL, fg=COLOR_MUTED, bg=COLOR_CARD,
+        )
+        self.lbl_verify_time.pack(side=tk.LEFT)
+
+        row2 = tk.Frame(verify_card, bg=COLOR_CARD)
+        row2.pack(fill=tk.X, pady=(4, 0))
+
+        self.lbl_head_hash = tk.Label(
+            row2, text="", font=FONT_MONO_SMALL, fg=COLOR_TEAL, bg=COLOR_CARD,
+        )
+        self.lbl_head_hash.pack(side=tk.LEFT)
+        self.lbl_head_hash.bind("<Button-1>", self._on_copy_head_hash)
+
+        self.lbl_failure_detail = tk.Label(
+            row2, text="", font=FONT_UI_SMALL, fg=COLOR_RED, bg=COLOR_CARD, wraplength=480, justify="left",
+        )
+        self.lbl_failure_detail.pack(side=tk.LEFT, padx=(6, 0))
+
+        # 4. Tamper & Restore Controls
+        tamper_box = tk.LabelFrame(
+            self, text=" TAMPER (DEMO ONLY) ", font=FONT_UI_TINY_BOLD,
+            bg=COLOR_PANEL, fg=COLOR_MUTED, padx=10, pady=8,
+        )
+        tamper_box.pack(fill=tk.X, padx=12, pady=6)
+
+        t_row = tk.Frame(tamper_box, bg=COLOR_PANEL)
+        t_row.pack(fill=tk.X)
+
+        tk.Label(t_row, text="Seq:", font=FONT_UI_SMALL, fg=COLOR_MUTED, bg=COLOR_PANEL).pack(side=tk.LEFT)
+        self.tamper_seq_var = tk.StringVar()
+        self.entry_tamper = tk.Entry(
+            t_row, textvariable=self.tamper_seq_var, font=FONT_MONO_SMALL,
+            bg=COLOR_CARD, fg=COLOR_TEXT, insertbackground=COLOR_TEAL,
+            borderwidth=1, relief="solid", width=9,
+        )
+        self.entry_tamper.pack(side=tk.LEFT, padx=(4, 8))
+        self.entry_tamper.bind("<Key>", self._on_tamper_key)
+
+        self.btn_tamper = tk.Button(
+            t_row, text="Tamper this row", font=FONT_UI_SMALL,
+            bg="#361010", fg=COLOR_RED, activebackground=COLOR_BORDER,
+            activeforeground=COLOR_RED, borderwidth=1, relief="solid", padx=6,
+            command=self._on_tamper,
+        )
+        self.btn_tamper.pack(side=tk.LEFT, padx=(0, 12))
+
+        self.btn_restore = tk.Button(
+            t_row, text="Restore Chain", font=FONT_UI_SMALL,
+            bg="#0d2b20", fg=COLOR_GREEN, activebackground=COLOR_BORDER,
+            activeforeground=COLOR_GREEN, borderwidth=1, relief="solid", padx=6,
+            command=self._on_restore,
+        )
+        self.btn_restore.pack(side=tk.LEFT)
+
+        self.lbl_tamper_note = tk.Label(
+            tamper_box, text="", font=FONT_UI_TINY, fg=COLOR_AMBER, bg=COLOR_PANEL, wraplength=480, justify="left",
+        )
+        self.lbl_tamper_note.pack(fill=tk.X, pady=(4, 0))
+
+        # 5. Static notes under strip
+        notes_frame = tk.Frame(self, bg=COLOR_PANEL, padx=12, pady=4)
+        notes_frame.pack(fill=tk.X)
+
+        tk.Label(
+            notes_frame,
+            text="Tamper-evident, not tamper-proof. The head hash is printed in the exported report so it can be checked outside the database.",
+            font=FONT_UI_TINY, fg=COLOR_MUTED, bg=COLOR_PANEL, wraplength=480, justify="left",
+        ).pack(fill=tk.X, pady=(0, 2))
+
+        tk.Label(
+            notes_frame,
+            text="Tamper and restore are demo-only controls.",
+            font=FONT_UI_TINY, fg=COLOR_MUTED, bg=COLOR_PANEL, wraplength=480, justify="left",
+        ).pack(fill=tk.X)
+
+    def _on_tamper_key(self, _event=None) -> None:
+        self._user_has_typed_tamper = True
+
+    def _toggle_mode(self) -> None:
+        if self._mode == "LIVE":
+            if self._visible_entries:
+                target = self._visible_entries[min(4, len(self._visible_entries) - 1)].get("seq", 0)
+            else:
+                target = 1
+            self._set_pinned_mode(target)
+        else:
+            self._set_live_mode()
+
+    def _set_pinned_mode(self, seq: int) -> None:
+        self._mode = "PINNED"
+        self._pinned_seq = seq
+        self.lbl_mode.config(text=f"[PINNED #{seq}]", fg=COLOR_AMBER, bg="#362208")
+        self.btn_mode_toggle.config(text="Back to live")
+        self._poll_trail()
+
+    def _set_live_mode(self) -> None:
+        self._mode = "LIVE"
+        self._pinned_seq = None
+        self._is_failed = False
+        self._is_verified = False
+        self.lbl_mode.config(text="[LIVE]", fg=COLOR_GREEN, bg="#0d2b20")
+        self.btn_mode_toggle.config(text="Pin")
+        self.lbl_tamper_note.config(text="")
+        self._poll_trail()
+
+    def _cancel_poll(self) -> None:
+        if self._poll_after_id:
+            try:
+                self.after_cancel(self._poll_after_id)
+            except Exception:
+                pass
+            self._poll_after_id = None
+
+    def _schedule_poll(self) -> None:
+        self._cancel_poll()
+        if self.app and self.app.state.selected_tab == "Audit":
+            self._poll_after_id = self.after(self.POLL_MS, self._poll_trail)
+
+    def _poll_trail(self) -> None:
+        if not self.app or not hasattr(self.app, "api_client"):
+            return
+        api = self.app.api_client
+        mode = self._mode
+        pinned = self._pinned_seq
+
+        def _bg():
+            try:
+                if mode == "PINNED":
+                    trail = api.get("/v1/audit/trail?limit=200")
+                else:
+                    trail = api.get("/v1/audit/trail?limit=8")
+                self.app.queue.put(("audit_trail", {"mode": mode, "pinned": pinned, "trail": trail}, time.time()))
+            except Exception as ex:
+                log_ascii("AuditTab trail poll error", ex)
+
+        threading.Thread(target=_bg, daemon=True, name="AuditTrailPoll").start()
+
+    def _handle_trail_result(self, data: Dict[str, Any]) -> None:
+        trail = data.get("trail", [])
+        if not isinstance(trail, list):
+            return
+
+        mode = data.get("mode", "LIVE")
+        pinned = data.get("pinned")
+
+        if mode == "PINNED" and pinned is not None:
+            idx_match = None
+            for i, entry in enumerate(trail):
+                if entry.get("seq") == pinned:
+                    idx_match = i
+                    break
+            if idx_match is not None:
+                start = max(0, min(idx_match - 3, len(trail) - self.NUM_BLOCKS))
+                visible = trail[start: start + self.NUM_BLOCKS]
+            else:
+                # If pinned seq is already in self._visible_entries, keep it so it never scrolls out of view
+                if any(e.get("seq") == pinned for e in self._visible_entries):
+                    self._schedule_poll()
+                    return
+                visible = trail[-self.NUM_BLOCKS:]
+        else:
+            visible = trail[-self.NUM_BLOCKS:]
+
+        self._render_blocks(visible)
+
+        if mode == "LIVE" and len(visible) >= 4 and not self._user_has_typed_tamper:
+            # 4th newest in 8 elements (0..7) is index 4
+            self.tamper_seq_var.set(str(visible[4].get("seq", "")))
+
+        self._schedule_poll()
+
+    def _render_blocks(self, entries: List[Dict[str, Any]]) -> None:
+        self._visible_entries = entries
+        for i in range(self.NUM_BLOCKS):
+            block = self._blocks[i]
+            if i < len(entries):
+                e = entries[i]
+                seq = e.get("seq", 0)
+                etype = str(e.get("entry_type", "event")).lower()
+                ref = str(e.get("ref_id", ""))
+                short_ref = ref[:8] + ".." if len(ref) > 8 else ref
+                ehash = str(e.get("entry_hash", ""))[:8]
+                phash = str(e.get("prev_hash", ""))[:8]
+
+                col = self.TYPE_COLORS.get(etype, COLOR_MUTED)
+
+                self.canvas.itemconfigure(block["type_text_id"], text=etype.upper(), fill=col)
+                self.canvas.itemconfigure(block["seq_text_id"], text=f"#{seq}")
+                self.canvas.itemconfigure(block["ref_text_id"], text=f"ref: {short_ref}")
+                self.canvas.itemconfigure(block["hash_text_id"], text=f"hash: {ehash}")
+                self.canvas.itemconfigure(block["prev_text_id"], text=f"prev: {phash}")
+
+                if self._is_verified:
+                    self.canvas.itemconfigure(block["card_id"], outline=COLOR_GREEN, width=2, fill=COLOR_CARD)
+                    self.canvas.itemconfigure(block["crack_id"], state="hidden")
+                    self.canvas.itemconfigure(block["status_id"], text="")
+                elif not self._is_verifying and not self._is_failed:
+                    self.canvas.itemconfigure(block["card_id"], outline=COLOR_BORDER, width=2, fill=COLOR_CARD)
+                    self.canvas.itemconfigure(block["crack_id"], state="hidden")
+                    self.canvas.itemconfigure(block["status_id"], text="")
+
+            else:
+                self.canvas.itemconfigure(block["type_text_id"], text="")
+                self.canvas.itemconfigure(block["seq_text_id"], text="")
+                self.canvas.itemconfigure(block["ref_text_id"], text="")
+                self.canvas.itemconfigure(block["hash_text_id"], text="")
+                self.canvas.itemconfigure(block["prev_text_id"], text="")
+                self.canvas.itemconfigure(block["crack_id"], state="hidden")
+                self.canvas.itemconfigure(block["status_id"], text="")
+                self.canvas.itemconfigure(block["card_id"], outline=COLOR_BORDER, width=2, fill=COLOR_CARD)
+
+    def _on_tamper(self) -> None:
+        self._is_verified = False
+        raw_seq = self.tamper_seq_var.get().strip()
+        if not raw_seq.isdigit():
+            if self.app and hasattr(self.app, "floor_view"):
+                self.app.floor_view.show_toast("Please enter a valid numeric seq", is_error=True)
+            return
+        seq = int(raw_seq)
+        api = self.app.api_client
+
+        def _bg():
+            try:
+                headers = {"X-Control-Key": "ctrl-secret-key-2026"}
+                resp = api.post("/v1/audit/tamper", json={"seq": seq}, headers=headers)
+                self.app.queue.put(("audit_tamper_result", {"ok": True, "seq": seq, "resp": resp}, time.time()))
+            except ApiException as ae:
+                self.app.queue.put(("audit_tamper_result", {"ok": False, "seq": seq, "error": str(ae.detail)}, time.time()))
+            except Exception as ex:
+                log_ascii(f"AuditTab tamper error on seq {seq}", ex)
+                self.app.queue.put(("audit_tamper_result", {"ok": False, "seq": seq, "error": str(ex)}, time.time()))
+
+        threading.Thread(target=_bg, daemon=True, name="AuditTamperThread").start()
+
+    def _handle_tamper_result(self, data: Dict[str, Any]) -> None:
+        if data.get("ok"):
+            seq = data.get("seq")
+            if self.app and hasattr(self.app, "floor_view"):
+                self.app.floor_view.show_toast(f"Tampered row #{seq}")
+            self._set_pinned_mode(seq)
+            self.lbl_tamper_note.config(
+                text="Row altered directly in the database, bypassing the hash. Now press Verify.",
+                fg=COLOR_AMBER,
+            )
+            if self.app and hasattr(self.app, "state"):
+                self.app.state.audit_ok = False
+        else:
+            err = data.get("error", "Unknown error")
+            if self.app and hasattr(self.app, "floor_view"):
+                self.app.floor_view.show_toast(f"Tamper failed: {err}", is_error=True)
+
+    def _on_restore(self) -> None:
+        self._is_verified = False
+        api = self.app.api_client
+
+        def _bg():
+            try:
+                headers = {"X-Control-Key": "ctrl-secret-key-2026"}
+                resp = api.post("/v1/audit/restore", json={}, headers=headers)
+                self.app.queue.put(("audit_restore_result", {"ok": True, "resp": resp}, time.time()))
+            except ApiException as ae:
+                self.app.queue.put(("audit_restore_result", {"ok": False, "error": str(ae.detail)}, time.time()))
+            except Exception as ex:
+                log_ascii("AuditTab restore error", ex)
+                self.app.queue.put(("audit_restore_result", {"ok": False, "error": str(ex)}, time.time()))
+
+        threading.Thread(target=_bg, daemon=True, name="AuditRestoreThread").start()
+
+    def _handle_restore_result(self, data: Dict[str, Any]) -> None:
+        if data.get("ok"):
+            resp = data.get("resp", {})
+            restored = resp.get("restored_seqs", [])
+            if self.app and hasattr(self.app, "floor_view"):
+                self.app.floor_view.show_toast(f"Restored audit entries: {restored}")
+            self.lbl_tamper_note.config(text="")
+            self._on_verify()
+        else:
+            err = data.get("error", "Unknown error")
+            if self.app and hasattr(self.app, "floor_view"):
+                self.app.floor_view.show_toast(f"Restore failed: {err}", is_error=True)
+
+    def _on_verify(self) -> None:
+        if self._is_verifying:
+            return
+        self._is_verifying = True
+        self._is_failed = False
+        self._is_verified = False
+        self.lbl_verify_status.config(text="Verifying cryptographic audit chain...", fg=COLOR_TEAL)
+        self.lbl_verify_time.config(text="")
+        self.lbl_head_hash.config(text="", cursor="")
+        self.lbl_failure_detail.config(text="")
+        api = self.app.api_client
+
+        def _bg():
+            t0 = time.perf_counter()
+            try:
+                res = api.get("/v1/audit/verify")
+                ms = (time.perf_counter() - t0) * 1000
+                self.app.queue.put(("audit_verify_result", {"ok": True, "res": res, "duration_ms": ms}, time.time()))
+            except ApiException as ae:
+                ms = (time.perf_counter() - t0) * 1000
+                self.app.queue.put(("audit_verify_result", {"ok": False, "error": str(ae.detail), "duration_ms": ms}, time.time()))
+            except Exception as ex:
+                ms = (time.perf_counter() - t0) * 1000
+                log_ascii("AuditTab verify error", ex)
+                self.app.queue.put(("audit_verify_result", {"ok": False, "error": str(ex), "duration_ms": ms}, time.time()))
+
+        threading.Thread(target=_bg, daemon=True, name="AuditVerifyThread").start()
+
+    def _handle_verify_result(self, data: Dict[str, Any]) -> None:
+        if not data.get("ok"):
+            self._is_verifying = False
+            err = data.get("error", "Verification request failed")
+            self.lbl_verify_status.config(text=f"Verification error: {err}", fg=COLOR_RED)
+            return
+
+        res = data.get("res", {})
+        ms = data.get("duration_ms", 0.0)
+        ok = res.get("ok", False)
+        failing_seq = res.get("failing_seq")
+
+        if not ok and failing_seq is not None:
+            if not any(e.get("seq") == failing_seq for e in self._visible_entries):
+                self._set_pinned_mode(failing_seq)
+
+        self._start_verify_sweep(res, ms)
+
+    def _start_verify_sweep(self, res: Dict[str, Any], ms: float) -> None:
+        for b in self._blocks:
+            self.canvas.itemconfigure(b["card_id"], outline=COLOR_BORDER, width=2, fill=COLOR_CARD)
+            self.canvas.itemconfigure(b["crack_id"], state="hidden")
+            self.canvas.itemconfigure(b["status_id"], text="")
+        self._sweep_step(0, res, ms)
+
+    def _sweep_step(self, idx: int, res: Dict[str, Any], ms: float) -> None:
+        ok = res.get("ok", False)
+        failing_seq = res.get("failing_seq")
+
+        if idx < len(self._visible_entries):
+            entry = self._visible_entries[idx]
+            seq = entry.get("seq")
+            block = self._blocks[idx]
+
+            if not ok and failing_seq is not None and seq == failing_seq:
+                self._is_verifying = False
+                self._is_failed = True
+                if self.app and hasattr(self.app, "state"):
+                    self.app.state.audit_ok = False
+                self.canvas.itemconfigure(block["card_id"], outline=COLOR_RED, width=3)
+                self.canvas.itemconfigure(block["crack_id"], state="normal")
+                self.canvas.itemconfigure(block["status_id"], text="BROKEN", fill=COLOR_RED)
+                self._flash_block(idx)
+
+                for j in range(idx + 1, len(self._visible_entries)):
+                    b_j = self._blocks[j]
+                    self.canvas.itemconfigure(b_j["card_id"], outline=COLOR_AMBER, width=2)
+                    self.canvas.itemconfigure(b_j["status_id"], text="after the break", fill=COLOR_AMBER)
+
+                self.lbl_verify_status.config(
+                    text=f"FAILED: first altered entry is seq {failing_seq}",
+                    fg=COLOR_RED,
+                )
+                self.lbl_verify_time.config(text=f"({ms:.1f} ms)", fg=COLOR_MUTED)
+                self.lbl_head_hash.config(text="", cursor="")
+                if res.get("error"):
+                    self.lbl_failure_detail.config(text=str(res.get("error")))
+                return
+
+            else:
+                self.canvas.itemconfigure(block["card_id"], outline=COLOR_GREEN, width=2)
+                self.after(70, lambda: self._sweep_step(idx + 1, res, ms))
+
+        else:
+            self._is_verifying = False
+            if ok:
+                self._is_verified = True
+                total = res.get("total_entries", 0)
+                if self.app and hasattr(self.app, "state"):
+                    self.app.state.audit_ok = True
+                    self.app.state.audit_total_entries = total
+                self.lbl_verify_status.config(
+                    text=f"VERIFIED: {total} entries intact",
+                    fg=COLOR_GREEN,
+                )
+                self.lbl_verify_time.config(text=f"({ms:.1f} ms)", fg=COLOR_MUTED)
+                head = str(res.get("head_hash") or "")
+                self._full_head_hash = head
+                short_head = head[:16] + "..." if len(head) > 16 else head
+                self.lbl_head_hash.config(
+                    text=f"head: {short_head} (click to copy)",
+                    fg=COLOR_TEAL,
+                    cursor="hand2",
+                )
+                self.lbl_failure_detail.config(text="")
+            else:
+                self._is_failed = True
+                self.lbl_verify_status.config(
+                    text=f"FAILED: first altered entry is seq {failing_seq} (outside visible blocks)",
+                    fg=COLOR_RED,
+                )
+                self.lbl_verify_time.config(text=f"({ms:.1f} ms)", fg=COLOR_MUTED)
+                self.lbl_head_hash.config(text="", cursor="")
+                if res.get("error"):
+                    self.lbl_failure_detail.config(text=str(res.get("error")))
+
+    def _flash_block(self, idx: int) -> None:
+        card_id = self._blocks[idx]["card_id"]
+        orig_fill = COLOR_CARD
+        self.canvas.itemconfigure(card_id, fill="#4a1515")
+        self.after(150, lambda: self.canvas.itemconfigure(card_id, fill=orig_fill))
+        self.after(300, lambda: self.canvas.itemconfigure(card_id, fill="#4a1515"))
+        self.after(450, lambda: self.canvas.itemconfigure(card_id, fill=orig_fill))
+
+    def _on_copy_head_hash(self, _event=None) -> None:
+        if self._full_head_hash:
+            self.clipboard_clear()
+            self.clipboard_append(self._full_head_hash)
+            if self.app and hasattr(self.app, "floor_view"):
+                self.app.floor_view.show_toast(f"Copied head hash: {self._full_head_hash[:16]}...")
+
+    def update_view(self, state: AppState) -> None:
+        if state.selected_tab == "Audit":
+            if not self._poll_after_id and not self._is_verifying:
+                self._poll_trail()
+        else:
+            self._cancel_poll()
+
+
 class NotebookPanel(tk.Frame):
     """Right tabbed inspection panel: Incidents, Impact, Audit, Candidate."""
 
@@ -3447,17 +4292,9 @@ class NotebookPanel(tk.Frame):
         self.impact_tab = ImpactTab(self.notebook, app=self.app)
         self.notebook.add(self.impact_tab, text="Impact")
 
-        # Tab 3: Audit (Placeholder for next stage)
-        self.audit_frame = tk.Frame(self.notebook, bg=COLOR_PANEL, padx=16, pady=16)
-        self.notebook.add(self.audit_frame, text="Audit")
-        lbl_audit = tk.Label(
-            self.audit_frame,
-            text="Audit panel coming soon...",
-            font=FONT_UI,
-            fg=COLOR_MUTED,
-            bg=COLOR_PANEL,
-        )
-        lbl_audit.pack(expand=True)
+        # Tab 3: Audit Tab
+        self.audit_tab = AuditTab(self.notebook, app=self.app)
+        self.notebook.add(self.audit_tab, text="Audit")
 
         # Tab 4: Candidate Status Tab
         self.candidate_tab = CandidateTab(self.notebook, app=self.app)
@@ -3472,6 +4309,8 @@ class NotebookPanel(tk.Frame):
             self.app.state.selected_tab = tab_names[sel_idx]
             if tab_names[sel_idx] == "Impact" and self.app.state.selected_incident:
                 self.app.trigger_impact_refresh(self.app.state.selected_incident)
+            elif tab_names[sel_idx] == "Audit":
+                self.audit_tab._poll_trail()
 
     def select_candidate_tab(self) -> None:
         """Programmatically switch to the Candidate tab."""
@@ -3480,9 +4319,17 @@ class NotebookPanel(tk.Frame):
         except Exception:
             pass
 
+    def select_audit_tab(self) -> None:
+        """Programmatically switch to the Audit tab."""
+        try:
+            self.notebook.select(self.audit_tab)
+        except Exception:
+            pass
+
     def update_view(self, state: AppState) -> None:
         self.incidents_tab.update_view(state)
         self.impact_tab.update_view(state)
+        self.audit_tab.update_view(state)
         self.candidate_tab.update_view(state)
 
 
@@ -3557,6 +4404,578 @@ class TickerStrip(tk.Frame):
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# GUIDED DEMO MANAGER
+# ---------------------------------------------------------------------------
+class GuidedDemoManager:
+    """Orchestrates 7-step guided demo mode via live API calls."""
+
+    def __init__(self, app: Any):
+        self.app = app
+        self.bar: Optional[GuidedControlBar] = None
+        self.step: int = 1
+        self.sub_step: str = ""
+        self.next_enabled: bool = False
+        self.step_start_ts: float = time.time()
+        self.step_durations: Dict[int, float] = {}
+        self.captions_shown: List[str] = []
+
+        self.tracked_incident_id: Optional[str] = None
+        self.tracked_candidate_id: Optional[str] = None
+        self.tracked_tampered_seq: Optional[int] = None
+        self.tracked_failing_seq: Optional[int] = None
+        self.override_modal: Optional[Any] = None
+
+        self.step3_inject_ts: float = 0.0
+        self.step4_start_ts: float = 0.0
+        self.step4_wait_time: float = 0.0
+        self.last_wait_start: float = time.time()
+        self.retry_cb: Optional[Any] = None
+        self.error_text: Optional[str] = None
+
+    def set_bar(self, bar: GuidedControlBar) -> None:
+        self.bar = bar
+
+    def _set_caption(self, text: str) -> None:
+        if self.bar:
+            self.bar.lbl_caption.config(text=text)
+        if text not in self.captions_shown:
+            self.captions_shown.append(text)
+            log_ascii(f"Guided Demo Caption: {text}")
+
+    def _set_error(self, err_msg: str, retry_func: Optional[Any] = None) -> None:
+        self.error_text = err_msg
+        self.retry_cb = retry_func
+        self.next_enabled = False
+        if self.bar:
+            self.bar.lbl_badge.config(text="[ERROR]", fg=COLOR_RED, bg="#361010")
+            self.bar.lbl_caption.config(text=f"Error: {err_msg}")
+            self.bar.lbl_substatus.config(text="Press Retry to try again.")
+            self.bar.btn_retry.pack(side=tk.LEFT, padx=(10, 0))
+            self.bar.btn_next.config(state="disabled", bg="#1e293b", cursor="arrow")
+
+    def _clear_error(self) -> None:
+        self.error_text = None
+        self.retry_cb = None
+        if self.bar:
+            self.bar.btn_retry.pack_forget()
+
+    def on_retry_clicked(self) -> None:
+        if self.retry_cb:
+            cb = self.retry_cb
+            self._clear_error()
+            cb()
+
+    def on_reset_clicked(self) -> None:
+        self.reset_demo(silent=False)
+
+    def reset_demo(self, silent: bool = False) -> None:
+        if self.tracked_incident_id:
+            self.previous_incident_id = self.tracked_incident_id
+        self._clear_error()
+        if self.override_modal:
+            try:
+                self.override_modal.destroy()
+            except Exception:
+                pass
+            self.override_modal = None
+
+        api = self.app.api_client
+        def _bg_restore():
+            try:
+                headers = {"X-Control-Key": "ctrl-secret-key-2026"}
+                api.post("/v1/audit/restore", json={}, headers=headers)
+            except Exception:
+                pass
+        threading.Thread(target=_bg_restore, daemon=True, name="GuidedResetRestore").start()
+
+        self.step = 1
+        self.sub_step = ""
+        self.next_enabled = False
+        self.tracked_incident_id = None
+        self.tracked_candidate_id = None
+        self.tracked_tampered_seq = None
+        self.tracked_failing_seq = None
+        self.step_start_ts = time.time()
+        self.last_wait_start = time.time()
+
+        if hasattr(self.app, "floor_view") and hasattr(self.app.floor_view, "scene"):
+            self.app.floor_view.scene.highlighted_centre = None
+
+        if self.bar:
+            self.bar.lbl_step.config(text="Step 1 of 7")
+            self.bar.lbl_badge.config(text="[WAITING]", fg=COLOR_AMBER, bg="#2a1f0a")
+            self.bar.lbl_caption.config(text="All five centres are live. Waiting for edge detection grace period to finish...")
+            self.bar.lbl_substatus.config(text="")
+            self.bar.btn_next.config(state="disabled", text="NEXT STEP", bg="#1e293b", cursor="arrow")
+
+        if not silent and hasattr(self.app, "floor_view"):
+            self.app.floor_view.show_toast("Demo reset to Step 1")
+
+    def on_next_step(self) -> None:
+        if not self.next_enabled or not self.bar:
+            return
+
+        now = time.time()
+
+        # Step 1 -> Step 2
+        if self.step == 1:
+            self.step_durations[1] = now - self.step_start_ts
+            self.step = 2
+            self.sub_step = ""
+            self.step_start_ts = now
+            self.app.floor_view.scene.highlighted_centre = "C-BPL-03"
+
+            r_data = self.app.state.readiness or {}
+            centres = r_data.get("centres", [])
+            c3 = next((c for c in centres if c.get("centre_id") == "C-BPL-03"), {})
+            v_have = c3.get("checks", {}).get("version", {}).get("have", "4.2.0")
+            v_need = r_data.get("required_version", "4.2.1")
+
+            self.bar.lbl_step.config(text="Step 2 of 7")
+            self.bar.lbl_badge.config(text="[READY]", fg=COLOR_GREEN, bg="#0d2b20")
+            self._set_caption(f"One lab is blocked before the exam due to software version mismatch at C-BPL-03 ({v_have} vs {v_need}).")
+            self.bar.lbl_substatus.config(text="Readiness padlock active: C-BPL-03 prevented from seating candidates.")
+            self.bar.btn_next.config(state="normal", bg=COLOR_TEAL, cursor="hand2")
+            self.next_enabled = True
+
+        # Step 2 -> Step 3
+        elif self.step == 2:
+            self.step_durations[2] = now - self.step_start_ts
+            self.step = 3
+            self.sub_step = "ready"
+            self.step_start_ts = now
+            self.app.floor_view.scene.highlighted_centre = None
+
+            self.bar.lbl_step.config(text="Step 3 of 7")
+            self.bar.lbl_badge.config(text="[READY]", fg=COLOR_GREEN, bg="#0d2b20")
+            self._set_caption("Cut power at C-BPL-02 for 30 seconds.")
+            self.bar.lbl_substatus.config(text="Press Next Step to inject a 30s power loss fault at C-BPL-02.")
+            self.bar.btn_next.config(state="normal", bg=COLOR_TEAL, cursor="hand2", text="NEXT STEP")
+            self.next_enabled = True
+
+        # Step 3 ready -> execute fault
+        elif self.step == 3 and self.sub_step == "ready":
+            self.sub_step = "waiting_incident"
+            self.next_enabled = False
+            self.last_wait_start = now
+            self.step3_inject_ts = now
+            self.bar.btn_next.config(state="disabled", bg="#1e293b", cursor="arrow")
+            self.bar.lbl_badge.config(text="[WAITING]", fg=COLOR_AMBER, bg="#2a1f0a")
+            self._set_caption("Power cut sent to C-BPL-02. Edge detection monitor detecting outage...")
+
+            self.app.floor_view.fault_panel.set_inputs("C-BPL-02", "Power loss", 30)
+            self.app.inject_fault("C-BPL-02", "power_loss", 30)
+
+        # Step 3 incident found -> Step 4
+        elif self.step == 3 and self.sub_step == "incident_found":
+            self.step_durations[3] = now - self.step_start_ts
+            self.step = 4
+            self.sub_step = "waiting_resolution"
+            self.step_start_ts = now
+            self.step4_start_ts = now
+            self.last_wait_start = now
+            self.next_enabled = False
+
+            self.app.state.selected_incident = self.tracked_incident_id
+            self.app.notebook_panel.select_incidents_tab()
+
+            inc_obj = next((i for i in self.app.state.incidents if i.get("incident_id") == self.tracked_incident_id), {})
+            itype = inc_obj.get("incident_type", "power_loss")
+            rule = inc_obj.get("classification_rule", "R_POWER_LOSS")
+            conf = inc_obj.get("confidence_score", 1.0)
+            conf_pct = int(conf * 100) if conf <= 1.0 else int(conf)
+
+            self.bar.lbl_step.config(text="Step 4 of 7")
+            self.bar.lbl_badge.config(text="[WAITING]", fg=COLOR_AMBER, bg="#2a1f0a")
+            self._set_caption(f"Incident detected ({itype}, {rule}, {conf_pct}% confidence). Waiting for 30s outage to resolve...")
+            self.bar.lbl_substatus.config(text="Live status: OPEN (waiting for recovery and impact calculation)...")
+            self.bar.btn_next.config(state="disabled", bg="#1e293b", cursor="arrow")
+
+        # Step 4 resolved -> Step 5
+        elif self.step == 4 and self.sub_step == "resolved":
+            self.step_durations[4] = now - self.step_start_ts
+            self.step = 5
+            self.sub_step = "5approve"
+            self.step_start_ts = now
+            self.app.notebook_panel.select_impact_tab()
+
+            impact = self.app.state.incident_impacts.get(self.tracked_incident_id) or {}
+            rows = impact.get("rows", [])
+            r3_row = next((r for r in rows if r.get("rule_id") == "R3" or r.get("remedy_recommended") == "manual_review"), None)
+            selected_row = r3_row or (rows[0] if rows else {})
+            self.tracked_candidate_id = selected_row.get("candidate_id")
+
+            if self.tracked_candidate_id and hasattr(self.app.notebook_panel.impact_tab, "tree"):
+                try:
+                    self.app.notebook_panel.impact_tab.tree.selection_set(self.tracked_candidate_id)
+                    self.app.notebook_panel.impact_tab._on_tree_select(None)
+                except Exception:
+                    pass
+
+            r_rule = selected_row.get("rule_id", "R3")
+            r_rat = selected_row.get("rationale") or selected_row.get("remedy_recommended", "")
+
+            self.bar.lbl_step.config(text="Step 5 of 7")
+            self.bar.lbl_badge.config(text="[READY]", fg=COLOR_GREEN, bg="#0d2b20")
+            self._set_caption(f"Who was affected, and what is fair: Candidate {self.tracked_candidate_id} flagged ({r_rule}: {r_rat}). Press Next Step to approve recommended remedies.")
+            self.bar.lbl_substatus.config(text="Automated rule engine evaluated all candidate facts.")
+            self.bar.btn_next.config(state="normal", bg=COLOR_TEAL, cursor="hand2")
+            self.next_enabled = True
+
+        # Step 5: Approve all recommended
+        elif self.step == 5 and self.sub_step == "5approve":
+            self.sub_step = "5approving"
+            self.next_enabled = False
+            self.last_wait_start = now
+            self.bar.btn_next.config(state="disabled", bg="#1e293b", cursor="arrow")
+            self.bar.lbl_badge.config(text="[WAITING]", fg=COLOR_AMBER, bg="#2a1f0a")
+            self._set_caption("Approving recommended remedies for affected candidates...")
+            self._run_approve_all()
+
+        # Step 5: Submit override modal
+        elif self.step == 5 and self.sub_step == "5override":
+            self.sub_step = "5overriding"
+            self.next_enabled = False
+            self.last_wait_start = now
+            self.bar.btn_next.config(state="disabled", bg="#1e293b", cursor="arrow")
+            self.bar.lbl_badge.config(text="[WAITING]", fg=COLOR_AMBER, bg="#2a1f0a")
+            self._set_caption(f"Submitting human override decision for {self.tracked_candidate_id}...")
+            if self.override_modal:
+                self.override_modal._on_submit()
+
+        # Step 5 done -> Step 6
+        elif self.step == 5 and self.sub_step == "5done":
+            self.step_durations[5] = now - self.step_start_ts
+            self.step = 6
+            self.sub_step = ""
+            self.step_start_ts = now
+            self.app.notebook_panel.select_candidate_tab(self.tracked_candidate_id)
+
+            def _update_cand_cap():
+                headline = ""
+                if hasattr(self.app.notebook_panel, "candidate_tab"):
+                    headline = self.app.notebook_panel.candidate_tab.lbl_headline.cget("text")
+                self.bar.lbl_step.config(text="Step 6 of 7")
+                self.bar.lbl_badge.config(text="[READY]", fg=COLOR_GREEN, bg="#0d2b20")
+                if headline:
+                    self._set_caption(f"What the candidate sees: Card loaded for {self.tracked_candidate_id}. Headline: '{headline}'.")
+                else:
+                    self._set_caption(f"What the candidate sees: Real candidate card for {self.tracked_candidate_id}.")
+                self.bar.lbl_substatus.config(text="Candidate card displays transparent resolution notice and updated timer.")
+                self.bar.btn_next.config(state="normal", bg=COLOR_TEAL, cursor="hand2")
+                self.next_enabled = True
+
+            self.app.root.after(300, _update_cand_cap)
+
+        # Step 6 -> Step 7
+        elif self.step == 6:
+            self.step_durations[6] = now - self.step_start_ts
+            self.step = 7
+            self.sub_step = "7a"
+            self.step_start_ts = now
+            self.app.notebook_panel.select_audit_tab()
+
+            self.bar.lbl_step.config(text="Step 7 of 7")
+            self.bar.lbl_badge.config(text="[READY]", fg=COLOR_GREEN, bg="#0d2b20")
+            self._set_caption("Prove nothing was changed: Press Next Step to verify cryptographic audit chain.")
+            self.bar.lbl_substatus.config(text="All operational events, incidents, and decisions are SHA-256 hash-chained.")
+            self.bar.btn_next.config(state="normal", bg=COLOR_TEAL, cursor="hand2")
+            self.next_enabled = True
+
+        # Step 7a: Run initial verify sweep
+        elif self.step == 7 and self.sub_step == "7a":
+            self.sub_step = "7a_verifying"
+            self.next_enabled = False
+            self.last_wait_start = now
+            self.bar.btn_next.config(state="disabled", bg="#1e293b", cursor="arrow")
+            self.bar.lbl_badge.config(text="[WAITING]", fg=COLOR_AMBER, bg="#2a1f0a")
+            self._set_caption("Verifying cryptographic audit chain...")
+            self.app.notebook_panel.audit_tab._on_verify()
+
+        # Step 7b: Tamper visible block
+        elif self.step == 7 and self.sub_step == "7b":
+            self.sub_step = "7b_tampering"
+            self.next_enabled = False
+            self.last_wait_start = now
+            self.bar.btn_next.config(state="disabled", bg="#1e293b", cursor="arrow")
+            self.bar.lbl_badge.config(text="[WAITING]", fg=COLOR_AMBER, bg="#2a1f0a")
+            self._set_caption(f"Tampering row #{self.tracked_tampered_seq} directly in database...")
+            self.app.notebook_panel.audit_tab._on_tamper()
+
+        # Step 7c: Verify tampered chain
+        elif self.step == 7 and self.sub_step == "7c":
+            self.sub_step = "7c_verifying"
+            self.next_enabled = False
+            self.last_wait_start = now
+            self.bar.btn_next.config(state="disabled", bg="#1e293b", cursor="arrow")
+            self.bar.lbl_badge.config(text="[WAITING]", fg=COLOR_AMBER, bg="#2a1f0a")
+            self._set_caption("Running audit verification across tampered chain...")
+            self.app.notebook_panel.audit_tab._on_verify()
+
+        # Step 7d: Restore database row and auto-verify
+        elif self.step == 7 and self.sub_step == "7d":
+            self.sub_step = "7d_restoring"
+            self.next_enabled = False
+            self.last_wait_start = now
+            self.bar.btn_next.config(state="disabled", bg="#1e293b", cursor="arrow")
+            self.bar.lbl_badge.config(text="[WAITING]", fg=COLOR_AMBER, bg="#2a1f0a")
+            self._set_caption("Restoring database row and running automatic verification...")
+            self.app.notebook_panel.audit_tab._on_restore()
+
+    def _run_approve_all(self) -> None:
+        inc_id = self.tracked_incident_id
+        api = self.app.api_client
+
+        def _bg():
+            headers = {"X-Controller-Key": "demo-controller-key"}
+            try:
+                # Try without acknowledge_fairness first
+                payload = {
+                    "decided_by": "controller.sharma",
+                    "reason": "Approved recommended remedies after reviewing evidence",
+                    "acknowledge_fairness": False,
+                }
+                resp = api.post(f"/v1/incidents/{inc_id}/decisions/approve-all", json=payload, headers=headers)
+                self.app.queue.put(("guided_approve_result", {"ok": True, "resp": resp, "ack_needed": False}, time.time()))
+            except ApiException as ae:
+                if "fairness" in ae.detail.lower() or ae.status_code == 400:
+                    try:
+                        # Retry with acknowledge_fairness = True
+                        payload["acknowledge_fairness"] = True
+                        resp = api.post(f"/v1/incidents/{inc_id}/decisions/approve-all", json=payload, headers=headers)
+                        self.app.queue.put(("guided_approve_result", {"ok": True, "resp": resp, "ack_needed": True}, time.time()))
+                        return
+                    except Exception as ex2:
+                        self.app.queue.put(("guided_approve_result", {"ok": False, "error": str(ex2)}, time.time()))
+                        return
+                self.app.queue.put(("guided_approve_result", {"ok": False, "error": ae.detail}, time.time()))
+            except Exception as ex:
+                self.app.queue.put(("guided_approve_result", {"ok": False, "error": str(ex)}, time.time()))
+
+        threading.Thread(target=_bg, daemon=True, name="GuidedApproveAllThread").start()
+
+    def handle_approve_result(self, data: Dict[str, Any]) -> None:
+        if not data.get("ok"):
+            err = data.get("error", "Approve all failed")
+            self._set_error(err, retry_func=self._run_approve_all)
+            return
+
+        resp = data.get("resp", {})
+        ack_needed = data.get("ack_needed", False)
+        appr_cnt = resp.get("approved", 0)
+        skipped_cnt = resp.get("skipped_manual_review", 0)
+
+        # Trigger impact refresh
+        if self.tracked_incident_id:
+            self.app.trigger_impact_refresh(self.tracked_incident_id)
+
+        impact = self.app.state.incident_impacts.get(self.tracked_incident_id) or {}
+        rows = impact.get("rows", [])
+        r3_row = next((r for r in rows if r.get("rule_id") == "R3" or r.get("remedy_recommended") == "manual_review"), None)
+
+        if skipped_cnt > 0 or r3_row is not None:
+            self.sub_step = "5override"
+            cand_for_review = r3_row or (rows[0] if rows else {})
+            self.tracked_candidate_id = cand_for_review.get("candidate_id", "cand-0015")
+            lost_s = float(cand_for_review.get("lost_seconds", 0))
+            extra_s = min(int(lost_s + 120), 1800)
+
+            # Open OverrideModal pre-filled
+            modal = OverrideModal(self.app.notebook_panel.impact_tab, self.app, self.tracked_incident_id, cand_for_review, "controller.sharma")
+            modal.remedy_var.set("extra_time")
+            modal._on_remedy_changed()
+            modal.extra_sec_var.set(str(extra_s))
+            modal.reason_text.delete("1.0", tk.END)
+            modal.reason_text.insert("1.0", "Weak evidence reviewed by controller; compensated with buffer")
+            self.override_modal = modal
+
+            ack_note = " (fairness acknowledgement accepted)" if ack_needed else ""
+            self.bar.lbl_badge.config(text="[READY]", fg=COLOR_GREEN, bg="#0d2b20")
+            self._set_caption(f"A human reviews the weak-evidence case for {self.tracked_candidate_id}. Press Next Step to confirm override.")
+            self.bar.lbl_substatus.config(text=f"Approved {appr_cnt} automated remedies{ack_note}; {skipped_cnt} left for human review.")
+            self.bar.btn_next.config(state="normal", bg=COLOR_TEAL, cursor="hand2")
+            self.next_enabled = True
+
+        else:
+            self.sub_step = "5done"
+            ack_note = " (fairness acknowledgement confirmed)" if ack_needed else ""
+            self.bar.lbl_badge.config(text="[READY]", fg=COLOR_GREEN, bg="#0d2b20")
+            self._set_caption(f"Approved {appr_cnt} candidate remedies{ack_note}. Press Next Step to inspect candidate card.")
+            self.bar.lbl_substatus.config(text="All remedies approved.")
+            self.bar.btn_next.config(state="normal", bg=COLOR_TEAL, cursor="hand2")
+            self.next_enabled = True
+
+    def handle_override_result(self, ok: bool, err_msg: Optional[str]) -> None:
+        if not ok:
+            err = err_msg or "Override failed"
+            self._set_error(err, retry_func=lambda: self.override_modal._on_submit() if self.override_modal else None)
+            return
+
+        self.override_modal = None
+        self.sub_step = "5done"
+        if self.tracked_incident_id:
+            self.app.trigger_impact_refresh(self.tracked_incident_id)
+
+        self.bar.lbl_badge.config(text="[READY]", fg=COLOR_GREEN, bg="#0d2b20")
+        self._set_caption(f"Override confirmed for {self.tracked_candidate_id}. Press Next Step to inspect candidate perspective.")
+        self.bar.lbl_substatus.config(text="Human override recorded in audit trail.")
+        self.bar.btn_next.config(state="normal", bg=COLOR_TEAL, cursor="hand2")
+        self.next_enabled = True
+
+    def tick(self) -> None:
+        if not self.bar or not getattr(self.app, "guided_mode", False):
+            return
+
+        now = time.time()
+
+        # Check for 120s timeout on pending waits
+        if not self.next_enabled and self.sub_step != "" and (now - self.last_wait_start > 120.0):
+            self._set_error(f"Wait exceeded 120 seconds for step {self.step} ({self.sub_step})",
+                            retry_func=lambda: setattr(self, "last_wait_start", time.time()))
+            return
+
+        # Step 1: waiting for 5 centres and grace == 0
+        if self.step == 1:
+            h_data = self.app.state.health or {}
+            det = h_data.get("detection") or {}
+            grace = float(det.get("grace_remaining_s", 0.0))
+            centres = self.app.state.centres
+
+            if len(centres) >= 5 and grace <= 0.0:
+                if not self.next_enabled:
+                    self.next_enabled = True
+                    self.bar.lbl_badge.config(text="[READY]", fg=COLOR_GREEN, bg="#0d2b20")
+                    self._set_caption("All five exam centres are live and edge detection grace period is complete.")
+                    self.bar.lbl_substatus.config(text="Ready to begin guided resilience scenario.")
+                    self.bar.btn_next.config(state="normal", bg=COLOR_TEAL, cursor="hand2")
+            else:
+                self.next_enabled = False
+                self.bar.lbl_badge.config(text="[WAITING]", fg=COLOR_AMBER, bg="#2a1f0a")
+                if grace > 0.0:
+                    self.bar.lbl_caption.config(text=f"All five centres are live. Waiting for start-up detection grace ({grace:.0f}s remaining)...")
+                else:
+                    self.bar.lbl_caption.config(text="Waiting for five centres to connect...")
+                self.bar.btn_next.config(state="disabled", bg="#1e293b", cursor="arrow")
+
+        # Step 3: waiting for incident
+        elif self.step == 3 and self.sub_step == "waiting_incident":
+            elapsed = now - self.step3_inject_ts
+            rem_30 = max(0.0, 30.0 - elapsed)
+            sw_str = self.app.floor_view.fault_panel.sw_line1.cget("text") or f"press to incident opened: {elapsed:.1f} s"
+            self.bar.lbl_caption.config(text=f"Power cut at C-BPL-02 (30s outage, {rem_30:.0f}s remaining). Edge monitor detecting outage...")
+            self.bar.lbl_substatus.config(text=sw_str)
+
+            candidates = [
+                i for i in self.app.state.incidents
+                if i.get("centre_id") == "C-BPL-02"
+            ]
+            prev_id = getattr(self, "previous_incident_id", None)
+            active_inc = next((i for i in candidates if i.get("status") in ("open", "recovering")), None)
+            if not active_inc and prev_id:
+                active_inc = next((i for i in candidates if i.get("incident_id") != prev_id), None)
+            if not active_inc and not prev_id and candidates:
+                active_inc = candidates[-1]
+
+            if active_inc and active_inc.get("incident_id") != prev_id:
+                self.tracked_incident_id = active_inc.get("incident_id")
+                self.sub_step = "incident_found"
+                self.next_enabled = True
+                self.bar.lbl_badge.config(text="[READY]", fg=COLOR_GREEN, bg="#0d2b20")
+                sw_final = self.app.floor_view.fault_panel.sw_line1.cget("text")
+                self._set_caption(f"Outage detected: Incident {self.tracked_incident_id} opened. {sw_final}.")
+                self.bar.lbl_substatus.config(text="Press Next Step to inspect incident card and classification.")
+                self.bar.btn_next.config(state="normal", bg=COLOR_TEAL, cursor="hand2")
+
+        # Step 4: waiting for resolution and impact rows
+        elif self.step == 4 and self.sub_step == "waiting_resolution":
+            inc_obj = next((i for i in self.app.state.incidents if i.get("incident_id") == self.tracked_incident_id), {})
+            st = (inc_obj.get("status") or "open").lower()
+            impact = self.app.state.incident_impacts.get(self.tracked_incident_id) or {}
+            rows = impact.get("rows", [])
+            is_computed = (st == "resolved" and impact.get("computed_at") is not None and len(rows) > 0)
+            elapsed = now - self.step4_start_ts
+
+            if is_computed:
+                self.step4_wait_time = elapsed
+                self.sub_step = "resolved"
+                self.next_enabled = True
+                itype = inc_obj.get("incident_type", "power_loss")
+                rule = inc_obj.get("classification_rule", "R_POWER_LOSS")
+                conf = inc_obj.get("confidence_score", 1.0)
+                conf_pct = int(conf * 100) if conf <= 1.0 else int(conf)
+
+                self.bar.lbl_badge.config(text="[READY]", fg=COLOR_GREEN, bg="#0d2b20")
+                self._set_caption(f"Incident {self.tracked_incident_id} resolved after {elapsed:.1f} s. Impact computed ({len(rows)} candidates).")
+                self.bar.lbl_substatus.config(text=f"Type: {itype}  |  Rule: {rule}  |  Confidence: {conf_pct}%  |  Status: RESOLVED")
+                self.bar.btn_next.config(state="normal", bg=COLOR_TEAL, cursor="hand2")
+            else:
+                itype = inc_obj.get("incident_type", "power_loss")
+                rule = inc_obj.get("classification_rule", "R_POWER_LOSS")
+                conf = inc_obj.get("confidence_score", 1.0)
+                conf_pct = int(conf * 100) if conf <= 1.0 else int(conf)
+                self.bar.lbl_badge.config(text="[WAITING]", fg=COLOR_AMBER, bg="#2a1f0a")
+                self.bar.lbl_caption.config(text=f"Incident detected ({itype}, {rule}, {conf_pct}% confidence). Waiting for 30s outage to resolve...")
+                self.bar.lbl_substatus.config(text=f"REAL status: {st.upper()}  |  Waiting time: {elapsed:.1f} s")
+                self.bar.btn_next.config(state="disabled", bg="#1e293b", cursor="arrow")
+
+        # Step 7a: waiting for verify sweep
+        elif self.step == 7 and self.sub_step == "7a_verifying":
+            audit_tab = getattr(self.app.notebook_panel, "audit_tab", None)
+            if audit_tab and not audit_tab._is_verifying and audit_tab._is_verified:
+                tot = audit_tab.lbl_verify_status.cget("text")
+                if len(audit_tab._visible_entries) >= 4:
+                    target_seq = audit_tab._visible_entries[3].get("seq", 0)
+                else:
+                    target_seq = int(audit_tab.tamper_seq_var.get() or 0)
+                self.tracked_tampered_seq = int(target_seq)
+                audit_tab.tamper_seq_var.set(str(target_seq))
+
+                self.sub_step = "7b"
+                self.next_enabled = True
+                self.bar.lbl_badge.config(text="[READY]", fg=COLOR_GREEN, bg="#0d2b20")
+                self._set_caption(f"Audit chain verified green ({tot}). Press Next Step to tamper row #{target_seq}.")
+                self.bar.lbl_substatus.config(text="All blocks swept green. Head hash intact.")
+                self.bar.btn_next.config(state="normal", bg=COLOR_TEAL, cursor="hand2")
+
+        # Step 7b: waiting for tamper & pill BROKEN
+        elif self.step == 7 and self.sub_step == "7b_tampering":
+            pill_text = self.app.top_bar.audit_pill.cget("text")
+            if "BROKEN" in pill_text:
+                self.sub_step = "7c"
+                self.next_enabled = True
+                self.bar.lbl_badge.config(text="[READY]", fg=COLOR_GREEN, bg="#0d2b20")
+                self._set_caption(f"Row #{self.tracked_tampered_seq} altered directly in database. Top bar shows audit BROKEN. Press Next Step to verify.")
+                self.bar.lbl_substatus.config(text="Bypassed hash calculation. Pinning strip around tampered sequence.")
+                self.bar.btn_next.config(state="normal", bg=COLOR_TEAL, cursor="hand2")
+
+        # Step 7c: waiting for verify fail
+        elif self.step == 7 and self.sub_step == "7c_verifying":
+            audit_tab = getattr(self.app.notebook_panel, "audit_tab", None)
+            if audit_tab and not audit_tab._is_verifying and audit_tab._is_failed:
+                self.tracked_failing_seq = self.tracked_tampered_seq
+                self.sub_step = "7d"
+                self.next_enabled = True
+                self.bar.lbl_badge.config(text="[READY]", fg=COLOR_GREEN, bg="#0d2b20")
+                self._set_caption(f"Verification failed: first altered entry is seq {self.tracked_failing_seq}. Press Next Step to restore database.")
+                self.bar.lbl_substatus.config(text="Tampered block cracked red; subsequent blocks marked amber after the break.")
+                self.bar.btn_next.config(state="normal", bg=COLOR_TEAL, cursor="hand2")
+
+        # Step 7d: waiting for restore & green
+        elif self.step == 7 and self.sub_step == "7d_restoring":
+            audit_tab = getattr(self.app.notebook_panel, "audit_tab", None)
+            pill_text = self.app.top_bar.audit_pill.cget("text")
+            if audit_tab and not audit_tab._is_verifying and audit_tab._is_verified and "OK" in pill_text:
+                self.sub_step = "7done"
+                self.step_durations[7] = now - self.step_start_ts
+                self.bar.lbl_badge.config(text="[COMPLETE]", fg=COLOR_GREEN, bg="#0d2b20")
+                self._set_caption("Database restored. Audit chain verified green. Demo complete.")
+                self.bar.lbl_substatus.config(text="All 7 guided resilience, operational, and audit steps completed.")
+                self.bar.btn_next.config(state="disabled", text="Demo Complete", bg="#1e293b", cursor="arrow")
+                self.next_enabled = False
+
+
+# ---------------------------------------------------------------------------
 # MAIN APPLICATION WINDOW
 # ---------------------------------------------------------------------------
 class ControlTowerApp:
@@ -3582,25 +5001,60 @@ class ControlTowerApp:
         self.api_client = ApiClient()
         self.poller = Poller(self.api_client, self.queue, self.state)
         self.is_closing = False
+        self.guided_mode = False
 
         # Build View Hierarchy
         self._build_layout()
 
+        self.guided_manager = GuidedDemoManager(self)
+        self.floor_view.guided_bar.set_manager(self.guided_manager)
+
         # Protocol handlers
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        # Hotkeys for clean recording takes
+        # Hotkeys for clean recording takes & fullscreen
         self.root.bind("<F3>", self._on_f3)
         self.root.bind("<F4>", self._on_f4)
+        self.root.bind("<F11>", self._toggle_fullscreen)
+        self.root.bind("<Escape>", self._exit_fullscreen)
+        self.root.bind("<space>", self._on_space_key)
 
         # Start background polling, GUI queue drain, and animation loops
         self.poller.start()
         self.root.after(100, self._drain_queue_loop)
         self.root.after(60, self._animate_loop)
 
+    def _toggle_fullscreen(self, _event=None) -> None:
+        is_fs = bool(self.root.attributes("-fullscreen"))
+        self.root.attributes("-fullscreen", not is_fs)
+
+    def _exit_fullscreen(self, _event=None) -> None:
+        self.root.attributes("-fullscreen", False)
+
+    def _on_space_key(self, _event=None) -> None:
+        widget = self.root.focus_get()
+        if isinstance(widget, (tk.Entry, tk.Text, ttk.Combobox)):
+            return
+        if self.guided_mode and self.guided_manager and self.guided_manager.next_enabled:
+            self.guided_manager.on_next_step()
+
+    def toggle_guided_mode(self) -> None:
+        self.guided_mode = not self.guided_mode
+        mode_str = "Guided" if self.guided_mode else "Free"
+        self.top_bar.set_mode(mode_str)
+        self.floor_view.fault_panel.set_guided_mode(self.guided_mode)
+        if self.guided_mode:
+            self.floor_view.guided_bar.place(relx=0.5, rely=0.98, anchor="s")
+            self.floor_view.guided_bar.lift()
+            self.guided_manager.reset_demo(silent=True)
+            self.floor_view.show_toast("Guided Mode enabled. Use NEXT STEP or Space key.")
+        else:
+            self.floor_view.guided_bar.place_forget()
+            self.floor_view.show_toast("Free Mode enabled. Manual control restored.")
+
     def _on_f3(self, _event=None) -> None:
         """F3 = inject a 40 s power loss at C-BPL-02."""
-        if not self.state.api_ok:
+        if self.guided_mode or not self.state.api_ok:
             return
         self.floor_view.fault_panel.set_inputs("C-BPL-02", "Power loss", 40)
         self.floor_view.fault_panel.update_state(self.state)
@@ -3608,6 +5062,11 @@ class ControlTowerApp:
 
     def _on_f4(self, _event=None) -> None:
         """F4 = inject a 30 s network drop at C-BPL-04."""
+        if self.guided_mode or not self.state.api_ok:
+            return
+        self.floor_view.fault_panel.set_inputs("C-BPL-04", "Network drop", 30)
+        self.floor_view.fault_panel.update_state(self.state)
+        self.floor_view.fault_panel.on_inject_clicked()
         if not self.state.api_ok:
             return
         self.floor_view.fault_panel.set_inputs("C-BPL-04", "Network drop", 30)
@@ -3656,7 +5115,7 @@ class ControlTowerApp:
     def _build_layout(self) -> None:
         """Construct top bar, 70/30 main area, and bottom ticker."""
         # Top Bar
-        self.top_bar = TopBar(self.root)
+        self.top_bar = TopBar(self.root, app=self)
         self.top_bar.pack(side=tk.TOP, fill=tk.X)
 
         sep_top = tk.Frame(self.root, bg=COLOR_BORDER, height=1)
@@ -3724,6 +5183,9 @@ class ControlTowerApp:
                         self.floor_view.show_toast(msg, is_error=not ok)
                         if inc_id:
                             self.trigger_impact_refresh(inc_id)
+                elif name == "guided_approve_result":
+                    if isinstance(data_or_err, dict) and hasattr(self, "guided_manager") and self.guided_manager:
+                        self.guided_manager.handle_approve_result(data_or_err)
                 elif name == "override_result":
                     if isinstance(data_or_err, dict):
                         ok = data_or_err.get("ok", False)
@@ -3740,6 +5202,8 @@ class ControlTowerApp:
                                     modal.destroy()
                                 except Exception:
                                     pass
+                            if getattr(self, "guided_mode", False) and hasattr(self, "guided_manager") and self.guided_manager:
+                                self.guided_manager.handle_override_result(True, None)
                         else:
                             err_msg = data_or_err.get("err", "")
                             if modal:
@@ -3748,13 +5212,30 @@ class ControlTowerApp:
                                 except Exception:
                                     pass
                             self.floor_view.show_toast(err_msg, is_error=True)
+                            if getattr(self, "guided_mode", False) and hasattr(self, "guided_manager") and self.guided_manager:
+                                self.guided_manager.handle_override_result(False, err_msg)
                 elif name == "candidate_status":
                     if isinstance(data_or_err, dict):
                         self.notebook_panel.candidate_tab._handle_poll_result(data_or_err)
+                elif name == "audit_trail":
+                    if isinstance(data_or_err, dict) and hasattr(self.notebook_panel, "audit_tab"):
+                        self.notebook_panel.audit_tab._handle_trail_result(data_or_err)
+                elif name == "audit_verify_result":
+                    if isinstance(data_or_err, dict) and hasattr(self.notebook_panel, "audit_tab"):
+                        self.notebook_panel.audit_tab._handle_verify_result(data_or_err)
+                elif name == "audit_tamper_result":
+                    if isinstance(data_or_err, dict) and hasattr(self.notebook_panel, "audit_tab"):
+                        self.notebook_panel.audit_tab._handle_tamper_result(data_or_err)
+                elif name == "audit_restore_result":
+                    if isinstance(data_or_err, dict) and hasattr(self.notebook_panel, "audit_tab"):
+                        self.notebook_panel.audit_tab._handle_restore_result(data_or_err)
                 else:
                     self.state.handle_poll_result(name, data_or_err, ts)
 
-            if self.state.last_successful_poll_ts > 0 and (time.time() - self.state.last_successful_poll_ts > 4.0):
+            if getattr(self, "guided_manager", None):
+                self.guided_manager.tick()
+
+            if self.state.liveness_consecutive_failures >= 2:
                 self.state.api_ok = False
                 self.state.api_status = "DOWN"
 
