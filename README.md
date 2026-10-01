@@ -1,122 +1,190 @@
 # Exam Resilience Control Tower (ERCT)
 
-**MPOnline Idea & Innovation Hackathon 2026** — *Problem Statement 6: Exam Operations Resilience & Integrity*
+**A resilience layer above any online exam platform: predict, detect, decide fairly, prove it.**
 
-ERCT is an end-to-end operational resilience, automated incident classification, and audit control plane for high-stakes online examinations. It provides real-time multi-centre telemetry ingestion, edge failure detection, deterministic rule-based candidate remedy evaluation (Rules R1–R4), and a tamper-evident hash chain (not tamper-proof) audit trail.
+MPOnline Idea and Innovation Hackathon 2026 | Technical Track | Problem Statement 6: Resilient and Trustworthy Online Assessment Ecosystem
 
----
+**Team XORO**: Dev Bandil (lead), Mayank Jain, Divyansh Chaurey, Saurabh Goyal
 
-## Architecture Overview
-
-1. **FastAPI Operational Backend (`app/`)**: High-throughput REST API backed by SQLite in Write-Ahead Logging (WAL) mode with monotonic event sequencing, idempotency deduplication, store-and-forward buffers, and tamper-evident hash chain (not tamper-proof) audit verification.
-2. **Multi-Agent Edge Simulator (`simulator/`)**: Autonomous emulator generating realistic candidate heartbeats, answer saves, biometric verifications, and controlled power/network disruptions across 5 regional exam centres (`C-BPL-01` to `C-BPL-05`).
-3. **Desktop Control Tower GUI (`gui.py`)**: Real-time visual control tower built exclusively with Python's standard `tkinter` (`ttk` + `Canvas`) and `httpx`, providing floor views, interactive fault panels, impact decisions, candidate status views, and tamper-evident hash chain (not tamper-proof) exploration.
+> Simulated exam environment. ERCT is decision support, not a replacement exam platform, and not proctoring.
 
 ---
 
-## Demo GUI
+## The problem
 
-The ERCT Control Tower provides a visual operations plane designed for examination controllers, invigilators, and technical evaluators.
+Large online exams keep failing in the same few ways: centre power cuts, unsafe software rollouts, overload, slow manual triage (complaints instead of logs) and records nobody can verify. Recent public reports include a power failure at Jaipur centres during NEET-PG 2026 (2,445 candidates, re-exam ordered), an AIAPGET 2026 power failure (49 of 192 candidates at one centre) and faulty server updates in JAMB UTME 2025 (379,997 candidates). Figures are as reported by the sources listed in our Problem Statement document.
 
-### What It Shows
+Exam platforms protect one candidate's session (autosave, offline buffers). Above the platform, an exam body still tends to lack fleet-level monitoring, evidence-based identification of who was affected, an explainable remedy, and a verifiable audit trail. This is our own analysis; we do not claim nothing similar exists.
 
-- **Interactive Exam Floor Canvas**: Live visual floor plan displaying all 5 exam centres, candidate seat pods, live heartbeat pulses, connection states, and readiness padlock indicators.
-- **Fault Injection & Precision Stopwatch**: Manual injection panel for power outages and network drops with stopwatch (seconds, one decimal) from pressing Inject to the incident opening. Detection time shown in the GUI includes the simulator picking up the fault command; the 2.1 s figure in the documents is last good heartbeat to incident opened.
-- **Chevron Lifecycle Tracker**: Automatic state-driven progress across *Prevention*, *Detection*, *Recovery*, *Impact Analysis*, *Decision*, and *Resolution*.
-- **Incidents & Classification Tab**: Real-time incident feed showing fault classification, rule triggers (e.g., `R_POWER_LOSS`), and confidence scoring.
-- **Impact & Fairness Tab**: Candidate-level impact fact matrix detailing lost time, disconnect counts, recommended remedies (Rules R1–R4), and human override workflows with fairness acknowledgement gates.
-- **Candidate Perspective Tab**: Real-time candidate view reflecting transparent incident notifications, session state, and allotted compensatory time.
-- **Audit Strip**: Visual representation of the tamper-evident hash chain (not tamper-proof) with live verification sweeps, pinpoint block cracking on simulated database tampering, and instant restoration.
+## What ERCT does
 
----
+Prevention, Detection, Response, Recovery, Trust:
 
-### How to Run
+| Stage | What ERCT does | In this MVP |
+|---|---|---|
+| Prevention | Readiness score and software-version gate per centre, computed from `config.yaml` | Implemented (config-based, no live probing) |
+| Detection | Heartbeat and centre-event monitoring; classifies power, network and software incidents within seconds | Implemented |
+| Response | Finds affected candidates from logs, recommends a remedy with rule and evidence, a human approves or overrides | Implemented |
+| Recovery | Server-side session state, store-and-forward replay, restart-safe incidents | Implemented |
+| Trust | Hash-chained audit log; `verify` names the first altered entry | Implemented |
 
-#### Option A: One-Click Launcher (Recommended on Windows)
-Run the root batch launcher:
-```cmd
+## How it works
+
+```
+ Candidate clients      Centre agents        Exam-platform adapter
+ (heartbeats, saves)    (power, version)     (simulator in the MVP)
+          \                   |                    /
+           +------------------+-------------------+
+                              v
+              Ingestion API (FastAPI): schema check, per-centre API key,
+              idempotent event_id, one transaction per batch
+                              |
+        +---------------------+----------------------+
+        v                     v                      v
+ Detection engine      Session ledger          Hash-chained audit log
+ (heartbeat gap,       and event store         (every event, incident,
+  power / network)     (SQLite, WAL)            impact and decision)
+        v
+ Incident manager (one active incident per centre, upgrade on late events)
+        v
+ Impact and remedy engine (affected list from logs, rules R3, R4, R1, R2)
+        v
+ Review queue + decisions (human approves or overrides) + fairness check
+        v
+ Candidate status and notices        Control-tower GUI (gui.py)
+```
+
+Key design choices:
+
+- **Evidence, not memory.** Impact is computed per candidate from heartbeats and saves. Silence is measured with server receive time and impact with event time, so a network backlog (no loss) and a power cut (real loss) that look alike at first get different remedies.
+- **Rules, not a black box.** Every recommendation stores the rule id, the evidence events and a plain-language reason. Weak evidence is never auto-decided.
+- **Human in the loop.** ERCT recommends; a controller approves or overrides, and who and why are written to the audit chain.
+- **Tamper-evident record.** SHA-256 hash chain over every entry. Verification returns the first altered sequence number. It is tamper-evident, not tamper-proof: an attacker with full database write access could rebuild the chain, which is why the head hash is meant to be checked outside the database.
+- **Resilient by construction.** At-least-once delivery with idempotent event ids, a disk-backed buffer with replay, a dead-letter path for invalid events, and incidents that survive an API restart.
+- **Privacy by design.** Pseudonymous candidate ids only; no names or contact data in events or audit payloads.
+
+### Remedy rules (first match wins, in the order R3, R4, R1, R2)
+
+| Rule | Condition | Recommendation |
+|---|---|---|
+| R3 | Evidence is not strong | `manual_review` (never auto-decided) |
+| R4 | At least half of the centre affected and an integrity flag is set | `retest_recommended` (centre-level suggestion to the controller only) |
+| R1 | Lost time at most 300 s and at most 2 unsaved answers | `resume`, remaining time restored |
+| R2 | Otherwise | `extra_time` = lost time + 120 s buffer |
+
+After remedies are computed, average extra time is compared across centres and large gaps are flagged to the controller before approval (fairness check).
+
+## Repository layout
+
+```
+app/         FastAPI backend: api/ (routes), core/ (detection, impact, audit chain, fairness), models/, config.py, db.py, main.py
+simulator/   Multi-agent exam simulator (5 centres x 40 candidates), fault injection, store-and-forward buffer
+gui.py       Desktop control tower (tkinter + httpx; talks to the API over HTTP only)
+demo/        Command-line live fault demo
+tests/       Automated tests (pytest)
+docs/        Design notes and decision log
+config.yaml  Centres, thresholds, readiness weights, remedy settings, demo keys
+run_demo.bat / reset_demo_data.bat   Windows launcher and fresh-data reset
+```
+
+## Quick start (Windows, Python 3.12)
+
+```
+pip install -r requirements.txt
 run_demo.bat
 ```
-`run_demo.bat` performs the complete startup sequence automatically:
-1. Starts the API server in its own console window (`python -m uvicorn app.main:app --host 127.0.0.1 --port 8000`).
-2. Polls `/v1/health` using an inline Python one-liner until the API answers healthy (up to 40 s).
-3. Starts the Multi-Agent Simulator in its own console window (`python -m simulator.agent_runner`).
-4. Displays a 20-second countdown for the edge detection start-up grace period.
-5. Launches `python gui.py`.
-6. Upon closing the GUI, displays a clean reminder to close the background API and simulator console windows.
 
-#### Option B: Manual Three-Terminal Startup
-In three separate terminal windows:
-```cmd
-# Terminal 1: Start API server
+`run_demo.bat` starts the API and the simulator in their own windows, waits for the API to answer, counts down the 20 s detection start-up grace, then opens the GUI. If port 8000 is already in use it tells you which process holds it and stops.
+
+Manual start, in three terminals:
+
+```
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
-
-# Terminal 2: Start multi-agent simulator
 python -m simulator.agent_runner
-
-# Terminal 3: Start desktop GUI
 python gui.py
 ```
 
-#### Resetting Demo Data
-To start a clean demonstration or recording take from an empty database:
-```cmd
-reset_demo_data.bat
+For a clean take, close all demo windows and run `reset_demo_data.bat` first. It deletes only `data\erct.db*` and `data\simulator_buffer.db*`. Do not leave the demo running for a long time: the audit chain grows with every event and `/v1/health` re-verifies it.
+
+Command-line fault demos (each run uses an isolated temporary database and prints the incident, evidence and audit verification):
+
 ```
-After confirmation, this script deletes only `data\erct.db*` and `data\simulator_buffer.db*`. It never deletes run outputs or log files.
+python demo\live_fault.py --type power_loss --centre C-BPL-02 --duration 60
+python demo\live_fault.py --type network_drop --centre C-BPL-04 --duration 30
+python demo\live_fault.py --type power_loss --centre C-BPL-02 --duration 60 --kill-api-at 25
+python -m app.core.audit_chain --verify
+```
 
----
+## The control-tower GUI
 
-### Guided vs Free Mode and Keybindings
+`gui.py` is a desktop app that shows the five labs and the server room, with power and network links. Every number and colour comes from an API response; nothing is faked.
 
-The top bar features a **"Guided / Free"** mode toggle button (default: `Free`).
+- **Floor view:** 5 labs x 40 PCs coloured by real session state; padlock on a centre blocked by the version gate.
+- **Fault injection:** cut power or drop the network at one lab; a stopwatch shows seconds from pressing Inject to the incident opening (this includes the simulator picking up the command; the last-heartbeat-to-incident time is measured separately).
+- **Incidents, Impact, Candidate and Audit tabs:** incident timeline; per-candidate lost time, unsaved answers, rule and rationale; approve or override with a reason; the candidate-facing status; the hash chain with Verify, a demo-only Tamper and Restore.
+- **Guided mode:** one NEXT STEP button (Space) walks through seven steps: centres live, a blocked lab, power cut, incident detected, who was affected and what is fair, what the candidate sees, prove nothing was changed.
+- **Keys:** `F3` power loss at C-BPL-02 (40 s), `F4` network drop at C-BPL-04 (30 s), `F11` fullscreen, `python gui.py --scale 1.25` for high-DPI screens.
 
-- **Guided Mode**:
-  - Activates a floating, bottom-centre glassmorphic control bar over the floor view.
-  - Displays a **"Step N of 7"** progress indicator, status badges, and 20 pt Segoe UI plain-language captions describing what will happen next.
-  - Controls include a large teal **NEXT STEP** button, a hidden **Retry** button (shown only on network failure or wait timeouts > 120 s), and a **Reset demo** button.
-  - Greys out the manual fault injection panel with the notice *"Guided mode: manual fault injection disabled"* to prevent accidental test interference.
-  - Walks through all 7 operational resilience milestones:
-    1. *All five centres are live*: Verifies 5 connected centres and grace expiry.
-    2. *One lab is blocked before the exam*: Highlights `C-BPL-03` software mismatch lock (`4.2.0` vs required `4.2.1`).
-    3. *Cut power at C-BPL-02*: Injects a 30 s outage and measures time to detection.
-    4. *Incident detected*: Tracks incident progression from `open` to `recovering` to `resolved`.
-    5. *Who was affected, and what is fair*: Reviews impact matrix, approves recommended remedies, and opens pre-filled override modal for manual review candidate (+120 s buffer).
-    6. *What the candidate sees*: Displays the candidate perspective and notice banner.
-    7. *Prove nothing was changed*: Executes green audit verification, tampers 4th visible block in SQLite, observes `audit: BROKEN`, verifies detection at the exact altered sequence, restores row, and re-verifies green.
-- **Free Mode**: Restores full manual control over fault injection, comboboxes, and workstation double-click inspection.
+The control and controller keys in `config.yaml` are demo keys for the local simulator.
 
-#### Keyboard Shortcuts & CLI Flags
+## API surface
 
-| Key / Flag | Scope | Function |
-| :--- | :--- | :--- |
-| <kbd>Space</kbd> | Guided Mode | Triggers **NEXT STEP** when ready. |
-| <kbd>F3</kbd> | Free Mode | Injects a 40 s power loss fault at `C-BPL-02`. |
-| <kbd>F4</kbd> | Free Mode | Injects a 30 s network drop fault at `C-BPL-04`. |
-| <kbd>F11</kbd> | Global | Toggles Fullscreen window mode (<kbd>Escape</kbd> exits fullscreen). |
-| `--scale <factor>` | CLI Flag | Scales typography, button dimensions, and canvas coordinates for high-DPI displays (e.g., `python gui.py --scale 1.25`). |
+| Method and path | Purpose |
+|---|---|
+| `POST /v1/events` | Ingest one event or a batch (idempotent by `event_id`, per-centre API key) |
+| `GET /v1/health` | Service status, event count, audit chain status |
+| `GET /v1/centres` | Centre status and live session counts |
+| `GET /v1/centres/{id}/sessions` | Per-candidate session state for a centre |
+| `GET /v1/readiness` | Readiness score and version gate per centre |
+| `GET /v1/incidents`, `GET /v1/incidents/{id}` | Incidents with evidence and timeline |
+| `GET /v1/incidents/{id}/impact` | Affected candidates, lost time, remedy, rule, rationale, decision |
+| `GET /v1/review-queue` | Cases waiting for human review |
+| `POST /v1/decisions`, `POST /v1/incidents/{id}/decisions/approve-all` | Approve or override (controller key; who and why recorded) |
+| `GET /v1/status/{candidate_id}`, `GET /v1/notices` | Candidate-facing status and notices |
+| `GET /v1/fairness` | Cross-centre remedy fairness check |
+| `GET /v1/audit/verify`, `GET /v1/audit/trail` | Verify the hash chain; recent entries |
+| `POST /v1/audit/tamper`, `POST /v1/audit/restore` | Demo only (control key) |
+| `POST /v1/control/faults` | Queue a fault for the simulator (control key) |
 
----
+## Measured results (simulated environment, one laptop)
 
-### Note on Demo Keys
+| Metric | Result |
+|---|---|
+| Event ingestion (5,000 events, batches of 500) | 3,965 to 4,667 events/s |
+| Replay of a 6,000-event backlog after an outage | 1.39 s, audit chain valid |
+| Power loss: last good heartbeat to incident opened | 2.1 s and 3.1 s in two live runs |
+| Network drop | Opened about 10 s after the link dropped (low confidence); upgraded 1.1 s after the link returned; 921 late events recovered across 40 sessions |
+| API process killed and restarted during an incident | Same incident id before and after |
+| Real kill/restart replay test | 160 events sent, 160 unique rows, 0 duplicates, audit verify OK |
+| Audit chain in a 90 s live run | 11,325 entries, verified |
+| Quiet run, 60 s, no fault | 0 incidents in 63 detection ticks |
 
-Control keys (`X-Control-Key: ctrl-secret-key-2026`) and controller authorization keys (`X-Controller-Key: demo-controller-key`) are embedded specifically for the local simulator, demo scripts, and evaluation harness. In production deployments, these are provisioned via external secret management and hardware tokens.
+These are simulator results, not claims about a production deployment.
 
----
+## Tests
 
-### System Limits & Design Assumptions (MVP)
-
-1. **Simulated Environment**: Telemetry, heartbeat streams, and hardware disruptions originate from the multi-agent simulator process.
-2. **Decision Support**: Automated remedy rules (R1–R4) provide transparent decision proposals; human controller override remains available and mandatory for weak-evidence cases.
-3. **Config-Based Readiness**: Pre-exam environment prerequisites (software versions, battery benchmarks) are evaluated declaratively against `config.yaml`.
-4. **Candidate Status Endpoint**: In this MVP, `GET /v1/status/{candidate_id}` operates as a transparent status query without candidate authentication tokens.
-
----
-
-## Automated Test Suite
-
-Run the full test suite with 85 passing tests, run with pytest -q while no demo processes are running:
-```cmd
+```
 python -m pytest -q
 ```
-**Verification status:** 85 passing tests covering tamper-evident hash chain (not tamper-proof) audit integrity, multi-agent fault injection, classification edge cases, store-and-forward failover, and kill-restart recovery.
+
+The suite takes about five and a half minutes because several tests start real processes. Run it with no demo processes running (API, simulator or GUI), otherwise tests can collide on the port and the database files.
+
+## Scope, limits and roadmap
+
+Not in this MVP:
+
+- Real vendor or exam-platform integration (a simulator adapter stands in).
+- Role-based login. The candidate status endpoint has no authentication in the MVP and uses sequential pseudonymous ids.
+- Early-warning risk score, latency and error-rate anomaly detection, HTML audit report export, independent watchdog, web dashboard.
+- Production storage and transport: PostgreSQL, a stream broker (NATS JetStream), an external audit anchor (immudb). Scaling beyond one machine is a design path, not a measurement.
+
+Roadmap: real adapters (Moodle or TAO plug-ins, a vendor API), the items above, a pilot with a state-level examination body, repeat-failure analytics by vendor and centre, multi-region deployment and regulator export formats.
+
+## Third-party software and AI assistance
+
+Open-source libraries and their licences are listed in [ATTRIBUTIONS.md](ATTRIBUTIONS.md). AI assistants used: Antigravity IDE with a Gemini model for code generation, and Claude (Anthropic) for planning, prompt drafting, document drafting and review. All code was reviewed and tested by the team. The repository was created for this hackathon and no earlier project code was reused.
+
+## Links
+
+- Repository: https://github.com/kcfl/erct
+- Demo video and documents: https://drive.google.com/drive/folders/16fkHBRo68dgbkpLJ9nCEFnkXA8WBh0Yr
